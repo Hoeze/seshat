@@ -204,11 +204,12 @@ fn search_with_room() {
     db.force_commit().unwrap();
     db.reload().unwrap();
 
+    // All words have to match, in both search syntaxes.
     let cases = [
         ("\"Test message\"", true),
         ("Test message", true),
-        ("Test anything", true),
-        ("anything message", true),
+        ("Test anything", false),
+        ("anything message", false),
         ("Test", true),
         ("message", true),
         ("massage", false),
@@ -216,18 +217,26 @@ fn search_with_room() {
     ];
 
     for (phrase, should_match) in cases.iter() {
-        let result = db
-            .search(phrase, SearchConfig::new().for_room("!test_room:localhost"))
-            .unwrap()
-            .results;
-        assert!(
-            should_match == &!result.is_empty(),
-            "searching for '{}' should not return a result, but found {}",
-            phrase,
-            result[0].event_source
-        );
-        if *should_match {
-            assert_eq!(result[0].event_source, EVENT.source);
+        for query_syntax in [false, true].iter() {
+            let result = db
+                .search(
+                    phrase,
+                    SearchConfig::new()
+                        .for_room("!test_room:localhost")
+                        .query_syntax(*query_syntax),
+                )
+                .unwrap()
+                .results;
+            assert!(
+                *should_match == !result.is_empty(),
+                "searching for '{}' (query syntax: {}) should not return a result, but found {}",
+                phrase,
+                query_syntax,
+                result[0].event_source
+            );
+            if *should_match {
+                assert_eq!(result[0].event_source, EVENT.source);
+            }
         }
     }
 }

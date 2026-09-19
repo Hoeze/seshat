@@ -308,7 +308,7 @@ class Seshat {
      * method.
      *
      * @param  {object} args Arguments object for the search.
-     * @param  {string} args.searchTerm The term that is used to search the
+     * @param  {string} args.search_term The term that is used to search the
      * database.
      * @param  {number} args.limit The maximum number of events that the search
      * should return.
@@ -318,6 +318,10 @@ class Seshat {
      * followed the event that matched the search term.
      * @param  {boolean} args.order_by_recency Should the search results be
      * ordered by event recency.
+     * @param  {boolean} args.query_syntax Should the search term be parsed
+     * with Tantivy's query syntax, e.g. <code>sender:"@alice:example.org"</code>.
+     * The default is the syntax of Synapse's server-side search, which never
+     * fails. An invalid Tantivy query rejects the promise.
      * @param  {string} args.next_batch The token to request the next page of
      * results.
      *

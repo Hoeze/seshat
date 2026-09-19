@@ -16,6 +16,7 @@
 mod encrypted_dir;
 #[cfg(feature = "encryption")]
 mod encrypted_stream;
+mod search_syntax;
 
 use std::{
     path::Path,
@@ -200,15 +201,6 @@ impl IndexSearcher {
     ) -> Result<Box<dyn tv::query::Query>, tv::TantivyError> {
         let mut keys = Vec::new();
 
-        let term = if let Some(room) = &config.room_id {
-            keys.push(self.room_id_field);
-            format!("+room_id:\"{}\" AND ({})", room, term)
-        } else if term.is_empty() {
-            "*".to_owned()
-        } else {
-            term.to_owned()
-        };
-
         if config.keys.is_empty() {
             keys.append(&mut vec![
                 self.body_field,
@@ -225,10 +217,36 @@ impl IndexSearcher {
             }
         }
 
-        let query_parser =
-            tv::query::QueryParser::new(self.schema.clone(), keys, self.tokenizer.clone());
+        let query: Box<dyn tv::query::Query> = if term.is_empty() {
+            Box::new(tv::query::AllQuery)
+        } else {
+            let mut query_parser =
+                tv::query::QueryParser::new(self.schema.clone(), keys, self.tokenizer.clone());
 
-        Ok(query_parser.parse_query(&term)?)
+            if config.query_syntax {
+                // All words have to match in both syntaxes.
+                query_parser.set_conjunction_by_default();
+                query_parser.parse_query(term)?
+            } else {
+                search_syntax::parse(&query_parser, term)?
+            }
+        };
+
+        // Add the room filter as a query, not as query syntax, so that the
+        // search term can't change what the filter means.
+        Ok(match &config.room_id {
+            Some(room) => {
+                let room = tv::query::TermQuery::new(
+                    Term::from_field_text(self.room_id_field, room),
+                    tv::schema::IndexRecordOption::Basic,
+                );
+                Box::new(tv::query::BooleanQuery::new(vec![
+                    (tv::query::Occur::Must, Box::new(room)),
+                    (tv::query::Occur::Must, query),
+                ]))
+            }
+            None => query,
+        })
     }
 
     #[allow(clippy::type_complexity)]
@@ -601,6 +619,145 @@ fn add_events_to_differing_rooms() {
         .unwrap()
         .results;
     assert_eq!(result.len(), 2);
+}
+
+#[test]
+fn default_search_syntax() {
+    let tmpdir = TempDir::new().unwrap();
+    let config = Config::new().set_language(&Language::English);
+    let index = Index::new(&tmpdir, &config).unwrap();
+
+    let mut writer = index.get_writer().unwrap();
+
+    let mut event = EVENT.clone();
+    event.content_value = "Don't miss https://example.org/a?b=c <3".to_string();
+    writer.add_event(&event).unwrap();
+    writer.force_commit().unwrap();
+    index.reload().unwrap();
+
+    let searcher = index.get_searcher();
+    let finds = |term: &str| {
+        let result = searcher.search(term, &Default::default());
+        assert!(result.is_ok(), "Search for {:?} failed", term);
+        !result.unwrap().results.is_empty()
+    };
+
+    // Chat input is text, never a syntax error.
+    for term in &[
+        "don't",
+        "https://example.org/a?b=c",
+        "<3",
+        "\"miss",
+        "miss :)",
+    ] {
+        assert!(finds(term), "Search for {:?} didn't find the event", term);
+    }
+
+    // "NOT" is a word here, not an operator.
+    assert!(!finds("miss NOT"));
+
+    // All words have to match, unless "or" separates them.
+    assert!(finds("miss don't"));
+    assert!(finds("miss and don't"));
+    assert!(!finds("miss nothing"));
+    assert!(finds("nothing OR miss"));
+
+    // Quotes make a phrase, a leading "-" excludes a word or phrase.
+    assert!(finds("\"don't miss\""));
+    assert!(!finds("\"miss don't\""));
+    assert!(finds("miss -nothing"));
+    assert!(!finds("miss -don't"));
+    assert!(!finds("miss -\"don't miss\""));
+
+    // Terms without anything to match find nothing.
+    for term in &["-miss", "->", "-", "or", ":)", "back\\slash", "   "] {
+        assert!(!finds(term), "Search for {:?} found the event", term);
+    }
+}
+
+#[test]
+fn query_syntax_search() {
+    let tmpdir = TempDir::new().unwrap();
+    let config = Config::new().set_language(&Language::English);
+    let index = Index::new(&tmpdir, &config).unwrap();
+
+    let mut writer = index.get_writer().unwrap();
+
+    let mut release = EVENT.clone();
+    release.event_id = "$release:localhost".to_string();
+    release.content_value = "We deploy the release".to_string();
+
+    let mut party = EVENT.clone();
+    party.event_id = "$party:localhost".to_string();
+    party.content_value = "Release party tonight".to_string();
+    party.sender = "@bob:example.org".to_string();
+
+    writer.add_event(&release).unwrap();
+    writer.add_event(&party).unwrap();
+    writer.force_commit().unwrap();
+    index.reload().unwrap();
+
+    let searcher = index.get_searcher();
+    let query = |term: &str| {
+        searcher
+            .search(term, SearchConfig::new().query_syntax(true))
+            .map(|r| r.results.into_iter().map(|(_, id)| id).collect::<Vec<_>>())
+    };
+
+    assert_eq!(query("release tonight").unwrap(), [party.event_id.clone()]);
+    assert_eq!(query("release -party").unwrap(), [release.event_id.clone()]);
+    assert_eq!(
+        query("\"release party\"").unwrap(),
+        [party.event_id.clone()]
+    );
+    assert_eq!(query("\"release pa\"*").unwrap(), [party.event_id.clone()]);
+    assert_eq!(
+        query("sender:\"@bob:example.org\"").unwrap(),
+        [party.event_id.clone()]
+    );
+    assert!(query("\"unclosed").is_err());
+
+    // The default syntax has no field filters, "sender:" is text there.
+    let result = searcher
+        .search("sender:\"@bob:example.org\"", &Default::default())
+        .unwrap()
+        .results;
+    assert!(result.is_empty());
+}
+
+#[test]
+fn search_term_cannot_escape_the_room_filter() {
+    let tmpdir = TempDir::new().unwrap();
+    let config = Config::new().set_language(&Language::English);
+    let index = Index::new(&tmpdir, &config).unwrap();
+
+    let mut writer = index.get_writer().unwrap();
+
+    let mut other_room = EVENT.clone();
+    other_room.event_id = "$other_room_event:localhost".to_string();
+    other_room.room_id = "!other:room".to_string();
+
+    writer.add_event(&EVENT).unwrap();
+    writer.add_event(&other_room).unwrap();
+    writer.force_commit().unwrap();
+    index.reload().unwrap();
+
+    let searcher = index.get_searcher();
+    let mut config = SearchConfig::new();
+    config.for_room(&EVENT.room_id).query_syntax(true);
+
+    // This term used to close the group of the room filter and add an
+    // unfiltered clause. On its own, it isn't a valid query.
+    assert!(searcher.search("Test) OR (body:Test", &config).is_err());
+
+    // A valid query can't widen the room filter either.
+    let result = searcher
+        .search("Test OR room_id:\"!other:room\"", &config)
+        .unwrap()
+        .results;
+
+    assert_eq!(result.len(), 1);
+    assert_eq!(result[0].1, EVENT.event_id);
 }
 
 #[test]

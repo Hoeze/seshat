@@ -14,6 +14,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   versions.
   [[#143](https://github.com/matrix-org/seshat/issues/143)]
 
+- **BREAKING**: Search terms use the syntax of Synapse's server-side search
+  by default, so Element's "all rooms" search treats encrypted and
+  unencrypted rooms the same way. All words have to match, where they used
+  to be combined with OR. `"double quotes"` make a phrase, a leading `-`
+  excludes a word or phrase, and `or` separates alternatives. Everything else
+  is text, so no search term fails with a syntax error anymore, including
+  URLs, `don't`, `<3` or `:)`.
+
+- Tantivy's query syntax is available with `SearchConfig::query_syntax(true)`,
+  or `query_syntax: true` in the Node bindings. It adds phrase prefix queries
+  like `"phrase pre"*` and field filters like `sender:"@alice:example.org"`.
+  All words have to match there as well.
+
+- The room filter is a separate query now, so a search term can't escape it
+  anymore.
+
 ## 6.0.1 - 2026-09-11
 
 - Fix the npm publish jobs failing to find `.node-version`.

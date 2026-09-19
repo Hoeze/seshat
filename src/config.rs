@@ -34,6 +34,7 @@ pub struct SearchConfig {
     pub(crate) room_id: Option<RoomId>,
     pub(crate) keys: Vec<EventType>,
     pub(crate) next_batch: Option<Uuid>,
+    pub(crate) query_syntax: bool,
 }
 
 impl SearchConfig {
@@ -120,6 +121,26 @@ impl SearchConfig {
         self.next_batch = Some(token);
         self
     }
+
+    /// Should the search term be parsed with Tantivy's query syntax.
+    ///
+    /// The default syntax is the one of Synapse's server-side search: all
+    /// words have to match, `"double quotes"` make a phrase, a leading `-`
+    /// excludes a word or phrase, and `or` separates alternatives. Everything
+    /// else is text, so the default syntax never fails.
+    ///
+    /// Tantivy's query syntax adds e.g. phrase prefix queries like
+    /// `"phrase prefi"*` and field filters like `sender:"@alice:example.org"`.
+    /// All words have to match there as well. An invalid query returns an
+    /// error.
+    ///
+    /// # Arguments
+    ///
+    /// * `query_syntax` - Flag to determine if the term is a query.
+    pub fn query_syntax(&mut self, query_syntax: bool) -> &mut Self {
+        self.query_syntax = query_syntax;
+        self
+    }
 }
 
 impl Default for SearchConfig {
@@ -132,6 +153,7 @@ impl Default for SearchConfig {
             room_id: None,
             keys: Vec::new(),
             next_batch: None,
+            query_syntax: false,
         }
     }
 }
