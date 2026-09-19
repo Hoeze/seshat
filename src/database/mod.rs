@@ -61,7 +61,7 @@ use crate::events::CheckpointDirection;
 #[cfg(test)]
 use crate::{EVENT, TOPIC_EVENT};
 
-const DATABASE_VERSION: i64 = 4;
+const DATABASE_VERSION: i64 = 5;
 const EVENTS_DB_NAME: &str = "events.db";
 
 pub(crate) enum ThreadMessage {
@@ -1219,6 +1219,30 @@ fn database_upgrade_v1_2() {
 }
 
 #[test]
+fn database_upgrade_v4() {
+    let tmpdir = tempdir().unwrap();
+
+    let db = Database::new(tmpdir.path()).unwrap();
+    let connection = db.get_connection().unwrap();
+    connection
+        .execute("UPDATE version SET version = '4'", [])
+        .unwrap();
+    drop(connection);
+    drop(db);
+
+    // A v4 database has an index in the old Tantivy format. Opening it needs
+    // to ask for a reindex.
+    let db = Database::new(tmpdir.path());
+    match db {
+        Ok(_) => panic!("Database doesn't need a reindex."),
+        Err(e) => match e {
+            Error::ReindexError => (),
+            e => panic!("Database doesn't need a reindex: {}", e),
+        },
+    }
+}
+
+#[test]
 fn delete_an_event() {
     let tmpdir = tempdir().unwrap();
     let db = Database::new(tmpdir.path()).unwrap();
@@ -1327,15 +1351,31 @@ fn user_version() {
 // TODO: This test fails on windows with a rather alarming "Invalid access to memory location."
 #[cfg(all(feature = "encryption", not(windows)))]
 fn sqlcipher_cipher_settings_update() {
-    let mut path = PathBuf::from(file!());
-    path.pop();
-    path.pop();
-    path.pop();
-    path.push("data/database/sqlcipher-v3");
+    // Copy test database to temp directory to avoid modifying the original
+    let mut src_path = PathBuf::from(file!());
+    src_path.pop();
+    src_path.pop();
+    src_path.pop();
+    src_path.push("data/database/sqlcipher-v3");
+
+    let tmpdir = tempdir().unwrap();
+    let path = tmpdir.path().to_path_buf();
+
+    let mut options = fs_extra::dir::CopyOptions::new();
+    options.content_only = true;
+    fs_extra::dir::copy(&src_path, &path, &options).expect("Failed to copy test database");
 
     let config = Config::new().set_passphrase("qR17RdpWurSh2pQRSc/EnsaO9V041kOwsZk0iSdUY/g");
-    let _db =
-        Database::new_with_config(&path, &config).expect("We should be able to open the database");
+
+    // This is a v4 database, so it needs a reindex. We only get to the reindex
+    // check after SQLCipher opened the database with the upgraded settings.
+    match Database::new_with_config(&path, &config) {
+        Ok(_) => panic!("Database doesn't need a reindex."),
+        Err(e) => match e {
+            Error::ReindexError => (),
+            e => panic!("We should be able to open the database: {}", e),
+        },
+    }
 }
 
 #[test]

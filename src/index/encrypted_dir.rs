@@ -17,6 +17,7 @@ use std::{
     fs::File,
     io::{BufWriter, Cursor, Error as IoError, ErrorKind, Read, Write},
     path::Path,
+    sync::Arc,
 };
 
 use byteorder::{BigEndian, ReadBytesExt, WriteBytesExt};
@@ -31,12 +32,9 @@ use pbkdf2::pbkdf2;
 use sha2::{Sha256, Sha512};
 
 use tantivy::directory::{
-    error::{
-        DeleteError, IOError as TvIoError, LockError, OpenDirectoryError, OpenReadError,
-        OpenWriteError,
-    },
-    AntiCallToken, Directory, DirectoryLock, Lock, ReadOnlySource, TerminatingWrite, WatchCallback,
-    WatchHandle, WritePtr,
+    error::{DeleteError, LockError, OpenDirectoryError, OpenReadError, OpenWriteError},
+    AntiCallToken, Directory, DirectoryLock, FileHandle, Lock, OwnedBytes, TerminatingWrite,
+    WatchCallback, WatchHandle, WritePtr,
 };
 
 use zeroize::Zeroizing;
@@ -162,7 +160,8 @@ pub struct EncryptedMmapDirectory {
 impl EncryptedMmapDirectory {
     fn new(store_key: KeyBuffer, path: &Path) -> Result<Self, OpenDirectoryError> {
         // Expand the store key into a encryption and MAC key.
-        let (encryption_key, mac_key) = EncryptedMmapDirectory::expand_store_key(&store_key)?;
+        let (encryption_key, mac_key) = EncryptedMmapDirectory::expand_store_key(&store_key)
+            .map_err(|e| OpenDirectoryError::wrap_io_error(e, path.to_path_buf()))?;
 
         // Open our underlying bare Tantivy mmap based directory.
         let mmap_dir = tantivy::directory::MmapDirectory::open(path)?;
@@ -198,12 +197,14 @@ impl EncryptedMmapDirectory {
         passphrase: &str,
         key_derivation_count: u32,
     ) -> Result<Self, OpenDirectoryError> {
+        let wrap_error = |e| OpenDirectoryError::wrap_io_error(e, path.as_ref().to_path_buf());
+
         if passphrase.is_empty() {
-            return Err(IoError::other("empty passphrase").into());
+            return Err(wrap_error(IoError::other("empty passphrase")));
         }
 
         if key_derivation_count == 0 {
-            return Err(IoError::other("invalid key derivation count").into());
+            return Err(wrap_error(IoError::other("invalid key derivation count")));
         }
 
         let key_path = path.as_ref().join(KEYFILE);
@@ -213,18 +214,20 @@ impl EncryptedMmapDirectory {
         // doesn't exist.
         let store_key = match key_file {
             Ok(k) => {
-                let (_, key) = EncryptedMmapDirectory::load_store_key(k, passphrase)?;
+                let (_, key) =
+                    EncryptedMmapDirectory::load_store_key(k, passphrase).map_err(wrap_error)?;
                 key
             }
             Err(e) => {
                 if e.kind() != ErrorKind::NotFound {
-                    return Err(e.into());
+                    return Err(wrap_error(e));
                 }
                 EncryptedMmapDirectory::create_new_store(
                     &key_path,
                     passphrase,
                     key_derivation_count,
-                )?
+                )
+                .map_err(wrap_error)?
             }
         };
         EncryptedMmapDirectory::new(store_key, path.as_ref())
@@ -244,15 +247,18 @@ impl EncryptedMmapDirectory {
     // EncryptedMmapDirectory gets upstreamed.
     #[allow(dead_code)]
     pub fn open<P: AsRef<Path>>(path: P, passphrase: &str) -> Result<Self, OpenDirectoryError> {
+        let wrap_error = |e| OpenDirectoryError::wrap_io_error(e, path.as_ref().to_path_buf());
+
         if passphrase.is_empty() {
-            return Err(IoError::other("empty passphrase").into());
+            return Err(wrap_error(IoError::other("empty passphrase")));
         }
 
         let key_path = path.as_ref().join(KEYFILE);
-        let key_file = File::open(key_path)?;
+        let key_file = File::open(key_path).map_err(wrap_error)?;
 
         // Expand the store key into a encryption and MAC key.
-        let (_, store_key) = EncryptedMmapDirectory::load_store_key(key_file, passphrase)?;
+        let (_, store_key) =
+            EncryptedMmapDirectory::load_store_key(key_file, passphrase).map_err(wrap_error)?;
         EncryptedMmapDirectory::new(store_key, path.as_ref())
     }
 
@@ -271,12 +277,12 @@ impl EncryptedMmapDirectory {
         old_passphrase: &str,
         new_passphrase: &str,
         new_key_derivation_count: u32,
-    ) -> Result<(), OpenDirectoryError> {
+    ) -> std::io::Result<()> {
         if old_passphrase.is_empty() || new_passphrase.is_empty() {
-            return Err(IoError::other("empty passphrase").into());
+            return Err(IoError::other("empty passphrase"));
         }
         if new_key_derivation_count == 0 {
-            return Err(IoError::other("invalid key derivation count").into());
+            return Err(IoError::other("invalid key derivation count"));
         }
 
         let key_path = path.as_ref().join(KEYFILE);
@@ -316,10 +322,7 @@ impl EncryptedMmapDirectory {
 
     /// Load a store key from the given file and decrypt it using the given
     /// passphrase.
-    fn load_store_key(
-        mut key_file: File,
-        passphrase: &str,
-    ) -> Result<(u32, KeyBuffer), OpenDirectoryError> {
+    fn load_store_key(mut key_file: File, passphrase: &str) -> std::io::Result<(u32, KeyBuffer)> {
         let mut iv = [0u8; IV_SIZE];
         let mut salt = [0u8; SALT_SIZE];
         let mut expected_mac = [0u8; MAC_LENGTH];
@@ -342,7 +345,7 @@ impl EncryptedMmapDirectory {
             .read_to_end(&mut encrypted_key)?;
 
         if version[0] != VERSION {
-            return Err(IoError::other("invalid index store version").into());
+            return Err(IoError::other("invalid index store version"));
         }
 
         // Re-derive our key using the passphrase and salt.
@@ -358,7 +361,7 @@ impl EncryptedMmapDirectory {
         )?;
 
         if mac.verify(&expected_mac).is_err() {
-            return Err(IoError::other("invalid MAC of the store key").into());
+            return Err(IoError::other("invalid MAC of the store key"));
         }
 
         let mut decryptor = Aes256Ctr::new_from_slices(&key, &iv)
@@ -395,7 +398,7 @@ impl EncryptedMmapDirectory {
         key_path: &Path,
         passphrase: &str,
         pbkdf_count: u32,
-    ) -> Result<KeyBuffer, OpenDirectoryError> {
+    ) -> std::io::Result<KeyBuffer> {
         // Derive a AES key from our passphrase using a randomly generated salt
         // to prevent bruteforce attempts using rainbow tables.
         let (key, hmac_key, salt) = EncryptedMmapDirectory::derive_key(passphrase, pbkdf_count)?;
@@ -425,7 +428,7 @@ impl EncryptedMmapDirectory {
         hmac_key: &[u8],
         store_key: &[u8],
         key_path: &Path,
-    ) -> Result<(), OpenDirectoryError> {
+    ) -> std::io::Result<()> {
         // Generate a random initialization vector for our AES encryptor.
         let iv = EncryptedMmapDirectory::generate_iv()?;
         let mut encryptor = Aes256Ctr::new_from_slices(key, &iv)
@@ -463,7 +466,7 @@ impl EncryptedMmapDirectory {
     }
 
     /// Generate a random IV.
-    fn generate_iv() -> Result<[u8; IV_SIZE], OpenDirectoryError> {
+    fn generate_iv() -> std::io::Result<[u8; IV_SIZE]> {
         let mut iv = [0u8; IV_SIZE];
         let mut rng = thread_rng();
         rng.try_fill(&mut iv[..])
@@ -472,7 +475,7 @@ impl EncryptedMmapDirectory {
     }
 
     /// Generate a random key.
-    fn generate_key() -> Result<KeyBuffer, OpenDirectoryError> {
+    fn generate_key() -> std::io::Result<KeyBuffer> {
         let mut key = Zeroizing::new(vec![0u8; KEY_SIZE]);
         let mut rng = thread_rng();
         rng.try_fill(&mut key[..])
@@ -497,7 +500,7 @@ impl EncryptedMmapDirectory {
     fn derive_key(
         passphrase: &str,
         pbkdf_count: u32,
-    ) -> Result<InitialKeyDerivationResult, OpenDirectoryError> {
+    ) -> std::io::Result<InitialKeyDerivationResult> {
         let mut rng = thread_rng();
         let mut salt = vec![0u8; SALT_SIZE];
         rng.try_fill(&mut salt[..])
@@ -509,10 +512,15 @@ impl EncryptedMmapDirectory {
 }
 
 // The Directory trait[dr] implementation for our EncryptedMmapDirectory.
-// [dr] https://docs.rs/tantivy/0.10.2/tantivy/directory/trait.Directory.html
+// [dr] https://docs.rs/tantivy/0.26.2/tantivy/directory/trait.Directory.html
 impl Directory for EncryptedMmapDirectory {
-    fn open_read(&self, path: &Path) -> Result<ReadOnlySource, OpenReadError> {
-        let source = self.mmap_dir.open_read(path)?;
+    fn get_file_handle(&self, path: &Path) -> Result<Arc<dyn FileHandle>, OpenReadError> {
+        let wrap_error = |e| OpenReadError::wrap_io_error(e, path.to_path_buf());
+        let source = self
+            .mmap_dir
+            .open_read(path)?
+            .read_bytes()
+            .map_err(wrap_error)?;
 
         let mut reader = AesReader::<Aes256Ctr, _>::new::<Hmac<Sha256>>(
             Cursor::new(source.as_slice()),
@@ -521,32 +529,24 @@ impl Directory for EncryptedMmapDirectory {
             IV_SIZE,
             MAC_LENGTH,
         )
-        .map_err(TvIoError::from)?;
+        .map_err(wrap_error)?;
 
         let mut decrypted = Vec::new();
-        reader
-            .read_to_end(&mut decrypted)
-            .map_err(TvIoError::from)?;
+        reader.read_to_end(&mut decrypted).map_err(wrap_error)?;
 
-        Ok(ReadOnlySource::from(decrypted))
+        Ok(Arc::new(OwnedBytes::new(decrypted)))
     }
 
     fn delete(&self, path: &Path) -> Result<(), DeleteError> {
         self.mmap_dir.delete(path)
     }
 
-    fn exists(&self, path: &Path) -> bool {
+    fn exists(&self, path: &Path) -> Result<bool, OpenReadError> {
         self.mmap_dir.exists(path)
     }
 
-    fn open_write(&mut self, path: &Path) -> Result<WritePtr, OpenWriteError> {
-        let file = match self.mmap_dir.open_write(path)?.into_inner() {
-            Ok(f) => f,
-            Err(e) => {
-                let error = IoError::from(e);
-                return Err(TvIoError::from(error).into());
-            }
-        };
+    fn open_write(&self, path: &Path) -> Result<WritePtr, OpenWriteError> {
+        let file = self.mmap_dir.open_write(path)?;
 
         let writer = AesWriter::<Aes256Ctr, Hmac<Sha256>, _>::new(
             file,
@@ -554,11 +554,12 @@ impl Directory for EncryptedMmapDirectory {
             &self.mac_key,
             IV_SIZE,
         )
-        .map_err(TvIoError::from)?;
+        .map_err(|e| OpenWriteError::wrap_io_error(e, path.to_path_buf()))?;
         Ok(BufWriter::new(Box::new(writer)))
     }
 
     fn atomic_read(&self, path: &Path) -> Result<Vec<u8>, OpenReadError> {
+        let wrap_error = |e| OpenReadError::wrap_io_error(e, path.to_path_buf());
         let data = self.mmap_dir.atomic_read(path)?;
 
         let mut reader = AesReader::<Aes256Ctr, _>::new::<Hmac<Sha256>>(
@@ -568,16 +569,14 @@ impl Directory for EncryptedMmapDirectory {
             IV_SIZE,
             MAC_LENGTH,
         )
-        .map_err(TvIoError::from)?;
+        .map_err(wrap_error)?;
         let mut decrypted = Vec::new();
 
-        reader
-            .read_to_end(&mut decrypted)
-            .map_err(TvIoError::from)?;
+        reader.read_to_end(&mut decrypted).map_err(wrap_error)?;
         Ok(decrypted)
     }
 
-    fn atomic_write(&mut self, path: &Path, data: &[u8]) -> std::io::Result<()> {
+    fn atomic_write(&self, path: &Path, data: &[u8]) -> std::io::Result<()> {
         let mut encrypted = Vec::new();
         {
             let mut writer = AesWriter::<Aes256Ctr, Hmac<Sha256>, _>::new(
@@ -590,6 +589,10 @@ impl Directory for EncryptedMmapDirectory {
         }
 
         self.mmap_dir.atomic_write(path, &encrypted)
+    }
+
+    fn sync_directory(&self) -> std::io::Result<()> {
+        self.mmap_dir.sync_directory()
     }
 
     fn watch(&self, watch_callback: WatchCallback) -> Result<WatchHandle, tantivy::TantivyError> {
@@ -605,12 +608,14 @@ impl Directory for EncryptedMmapDirectory {
 }
 
 // This Tantivy trait is used to indicate when no more writes are expected to be
-// done on a writer.
-impl<E: StreamCipher + KeyIvInit, M: Mac + NewMac, W: Write> TerminatingWrite
+// done on a writer. We write our MAC and then terminate the underlying writer,
+// which flushes and syncs the file.
+impl<E: StreamCipher + KeyIvInit, M: Mac + NewMac, W: TerminatingWrite> TerminatingWrite
     for AesWriter<E, M, W>
 {
-    fn terminate_ref(&mut self, _: AntiCallToken) -> std::io::Result<()> {
-        self.finalize()
+    fn terminate_ref(&mut self, token: AntiCallToken) -> std::io::Result<()> {
+        self.finalize()?;
+        self.writer.terminate_ref(token)
     }
 }
 

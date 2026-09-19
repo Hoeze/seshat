@@ -305,7 +305,7 @@ impl RecoveryDatabase {
     /// opened.
     pub fn index_events(&mut self, events: &[Event]) -> Result<()> {
         match self.index_writer.as_mut() {
-            Some(writer) => events.iter().map(|e| writer.add_event(e)).collect(),
+            Some(writer) => events.iter().try_for_each(|e| writer.add_event(e))?,
             None => panic!("Index wasn't deleted"),
         }
 

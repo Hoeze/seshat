@@ -70,7 +70,7 @@ impl Database {
             let event_id = Database::save_event(connection, &mut e, &mut p)?;
             match event_id {
                 Some(id) => {
-                    index_writer.add_event(&e);
+                    index_writer.add_event(&e)?;
                     ret.push(false);
                     event_ids.push(id);
                 }
@@ -291,6 +291,19 @@ impl Database {
 
             reindex_needed = true;
             version = 4;
+        }
+
+        // Tantivy 0.26 can't read an index written by Tantivy 0.12, so the
+        // index needs to be rebuilt.
+        if version == 4 {
+            let transaction = connection.transaction()?;
+
+            transaction.execute("UPDATE reindex_needed SET reindex_needed = ?1", [true])?;
+            transaction.execute("UPDATE version SET version = '5'", [])?;
+            transaction.commit()?;
+
+            reindex_needed = true;
+            version = 5;
         }
 
         Ok((version, reindex_needed))

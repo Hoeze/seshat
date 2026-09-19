@@ -118,7 +118,7 @@ impl Writer {
 
         for (id, event) in ret.drain(..) {
             self.uncommitted_events.push(id);
-            self.inner.add_event(&event);
+            self.inner.add_event(&event)?;
         }
 
         let ret = Database::load_pending_deletion_events(&self.connection)?;

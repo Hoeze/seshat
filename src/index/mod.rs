@@ -27,7 +27,8 @@ use lru_cache::LruCache;
 use tantivy as tv;
 use tantivy::{
     collector::{Count, MultiCollector, TopDocs},
-    Term,
+    schema::Value,
+    Order, Term,
 };
 use uuid::Uuid;
 
@@ -38,16 +39,8 @@ use crate::{
     events::{Event, EventId, EventType},
 };
 
-// Tantivy requires at least 3MB per writer thread and will panic if we
-// give it less than 3MB for the total writer heap size. The amount of writer
-// threads that Tantivy will spawn depends on the amount of heap we give it.
-// The logic for the number of threads is as follows:
-//
-//     num_threads = { num_cpu,                  if heap_size / num_cpu >= 3MB
-//                   { max(heap_size / 3MB, 1),  if heap_size / num_cpu <  3MB
-//
-// We give Tantivy 50MB of heap size, which would spawn up to 16 writer threads
-// given a CPU with 16 or more cores.
+// Tantivy requires at least 15MB of heap per writer thread and returns an
+// error if we give it less. We use a single writer thread with 50MB of heap.
 const TANTIVY_WRITER_HEAP_SIZE: usize = 50_000_000;
 
 // Tantivy doesn't behave nicely if `commit()` is called too often on the index
@@ -152,8 +145,8 @@ impl Writer {
         Ok(())
     }
 
-    pub fn add_event(&mut self, event: &Event) {
-        let mut doc = tv::Document::default();
+    pub fn add_event(&mut self, event: &Event) -> Result<(), tv::TantivyError> {
+        let mut doc = tv::TantivyDocument::default();
 
         match event.event_type {
             EventType::Message => doc.add_text(self.body_field, &event.content_value),
@@ -166,8 +159,10 @@ impl Writer {
         doc.add_text(self.sender_field, &event.sender);
         doc.add_u64(self.date_field, event.server_ts as u64);
 
-        self.inner.add_document(doc);
+        self.inner.add_document(doc)?;
         self.events_pending_commit += 1;
+
+        Ok(())
     }
 
     /// Delete the event with the given event id from the index.
@@ -183,7 +178,7 @@ impl Writer {
 }
 
 pub(crate) struct IndexSearcher {
-    inner: tv::LeasedItem<tv::Searcher>,
+    inner: tv::Searcher,
     schema: tv::schema::Schema,
     tokenizer: tv::tokenizer::TokenizerManager,
     body_field: tv::schema::Field,
@@ -249,8 +244,10 @@ impl IndexSearcher {
         let count_handle = multicollector.add_collector(Count);
 
         let (mut result, top_docs) = if order_by_recency {
-            let top_docs_handle = multicollector
-                .add_collector(TopDocs::with_limit(limit).order_by_u64_field(self.date_field));
+            let date_field = self.schema.get_field_name(self.date_field);
+            let top_docs_handle = multicollector.add_collector(
+                TopDocs::with_limit(limit).order_by_u64_field(date_field, Order::Desc),
+            );
 
             let mut result = self.inner.search(query, &multicollector)?;
             let mut top_docs = top_docs_handle.extract(&mut result);
@@ -262,7 +259,8 @@ impl IndexSearcher {
                     .collect(),
             )
         } else {
-            let top_docs_handle = multicollector.add_collector(TopDocs::with_limit(limit));
+            let top_docs_handle =
+                multicollector.add_collector(TopDocs::with_limit(limit).order_by_score());
             let mut result = self.inner.search(query, &multicollector)?;
 
             let top_docs = top_docs_handle.extract(&mut result);
@@ -277,13 +275,13 @@ impl IndexSearcher {
         let end = count == top_docs.len();
 
         for (score, docaddress) in top_docs {
-            let doc = match self.inner.doc(docaddress) {
+            let doc = match self.inner.doc::<tv::TantivyDocument>(docaddress) {
                 Ok(d) => d,
                 Err(_e) => continue,
             };
 
             let event_id: EventId = match doc.get_first(self.event_id_field) {
-                Some(s) => s.text().unwrap().to_owned(),
+                Some(s) => s.as_str().unwrap().to_owned(),
                 None => continue,
             };
 
@@ -419,7 +417,7 @@ impl Index {
         match &config.tokenizer_mode {
             TokenizerMode::Ngram { min_gram, max_gram } => {
                 let ngram_tokenizer =
-                    tv::tokenizer::NgramTokenizer::new(*min_gram, *max_gram, false);
+                    tv::tokenizer::NgramTokenizer::new(*min_gram, *max_gram, false)?;
                 index
                     .tokenizers()
                     .register(&tokenizer_name, ngram_tokenizer);
@@ -428,11 +426,13 @@ impl Index {
                 match config.language {
                     Language::Unknown => (), // Use default tokenizer
                     _ => {
-                        let tokenizer =
-                            tv::tokenizer::TextAnalyzer::from(tv::tokenizer::SimpleTokenizer)
-                                .filter(tv::tokenizer::RemoveLongFilter::limit(40))
-                                .filter(tv::tokenizer::LowerCaser)
-                                .filter(tv::tokenizer::Stemmer::new(config.language.as_tantivy()));
+                        let tokenizer = tv::tokenizer::TextAnalyzer::builder(
+                            tv::tokenizer::SimpleTokenizer::default(),
+                        )
+                        .filter(tv::tokenizer::RemoveLongFilter::limit(40))
+                        .filter(tv::tokenizer::LowerCaser)
+                        .filter(tv::tokenizer::Stemmer::new(config.language.as_tantivy()))
+                        .build();
                         index.tokenizers().register(&tokenizer_name, tokenizer);
                     }
                 }
@@ -553,7 +553,7 @@ fn add_an_event() {
 
     let mut writer = index.get_writer().unwrap();
 
-    writer.add_event(&EVENT);
+    writer.add_event(&EVENT).unwrap();
     writer.force_commit().unwrap();
     index.reload().unwrap();
 
@@ -581,8 +581,8 @@ fn add_events_to_differing_rooms() {
     let mut event2 = EVENT.clone();
     event2.room_id = "!Test2:room".to_string();
 
-    writer.add_event(&EVENT);
-    writer.add_event(&event2);
+    writer.add_event(&EVENT).unwrap();
+    writer.add_event(&event2).unwrap();
 
     writer.force_commit().unwrap();
     index.reload().unwrap();
@@ -611,7 +611,7 @@ fn switch_languages() {
 
     let mut writer = index.get_writer().unwrap();
 
-    writer.add_event(&EVENT);
+    writer.add_event(&EVENT).unwrap();
     writer.force_commit().unwrap();
     index.reload().unwrap();
 
@@ -643,7 +643,7 @@ fn event_count() {
     let mut writer = index.get_writer().unwrap();
 
     assert_eq!(writer.events_pending_commit, 0);
-    writer.add_event(&EVENT);
+    writer.add_event(&EVENT).unwrap();
     assert_eq!(writer.events_pending_commit, 1);
 
     writer.force_commit().unwrap();
@@ -658,8 +658,8 @@ fn delete_an_event() {
 
     let mut writer = index.get_writer().unwrap();
 
-    writer.add_event(&EVENT);
-    writer.add_event(&TOPIC_EVENT);
+    writer.add_event(&EVENT).unwrap();
+    writer.add_event(&TOPIC_EVENT).unwrap();
     writer.force_commit().unwrap();
     index.reload().unwrap();
 
@@ -695,8 +695,8 @@ fn paginated_search() {
 
     let mut writer = index.get_writer().unwrap();
 
-    writer.add_event(&EVENT);
-    writer.add_event(&TOPIC_EVENT);
+    writer.add_event(&EVENT).unwrap();
+    writer.add_event(&TOPIC_EVENT).unwrap();
     writer.force_commit().unwrap();
     index.reload().unwrap();
 
@@ -728,7 +728,7 @@ fn ngram_tokenizer_mode() {
     let index = Index::new(&tmpdir, &config).unwrap();
 
     let mut writer = index.get_writer().unwrap();
-    writer.add_event(&EVENT);
+    writer.add_event(&EVENT).unwrap();
     writer.force_commit().unwrap();
     index.reload().unwrap();
 
@@ -750,7 +750,7 @@ fn schema_mismatch_on_tokenizer_mode_change() {
         let config = Config::new().set_language(&Language::English);
         let index = Index::new(&tmpdir, &config).unwrap();
         let mut writer = index.get_writer().unwrap();
-        writer.add_event(&EVENT);
+        writer.add_event(&EVENT).unwrap();
         writer.force_commit().unwrap();
     }
 
@@ -771,7 +771,7 @@ fn schema_mismatch_on_ngram_size_change() {
         let config = Config::new().use_ngram_tokenizer(2, 4);
         let index = Index::new(&tmpdir, &config).unwrap();
         let mut writer = index.get_writer().unwrap();
-        writer.add_event(&EVENT);
+        writer.add_event(&EVENT).unwrap();
         writer.force_commit().unwrap();
     }
 
@@ -812,7 +812,7 @@ fn ngram_tokenizer_japanese() {
     );
 
     let mut writer = index.get_writer().unwrap();
-    writer.add_event(&japanese_event);
+    writer.add_event(&japanese_event).unwrap();
     writer.force_commit().unwrap();
     index.reload().unwrap();
 

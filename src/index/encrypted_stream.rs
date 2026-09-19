@@ -42,7 +42,7 @@ const BUFFER_SIZE: usize = 8192;
 /// [mac]: https://docs.rs/crypto-mac/0.7.0/crypto_mac/trait.Mac.html
 pub struct AesWriter<E: StreamCipher + KeyIvInit, M: Mac + NewMac, W: Write> {
     /// Writer to write encrypted data to
-    writer: W,
+    pub(crate) writer: W,
     /// Encryptor to encrypt data with
     enc: E,
     mac: M,

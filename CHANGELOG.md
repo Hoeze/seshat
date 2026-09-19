@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## Unreleased
 
+- **BREAKING**: Upgrade Tantivy from 0.12 to 0.26. Tantivy 0.26 can't read
+  indexes in the old format, so the database version goes up to 5. Opening an
+  existing database returns `ReindexError`. Rebuild the index with
+  `RecoveryDatabase`. `serde` and `serde_json` are no longer pinned to exact
+  versions.
+  [[#143](https://github.com/matrix-org/seshat/issues/143)]
+
 ## 6.0.1 - 2026-09-11
 
 - Fix the npm publish jobs failing to find `.node-version`.
