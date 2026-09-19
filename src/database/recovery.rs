@@ -5,6 +5,7 @@ use std::{
         atomic::{AtomicU64, Ordering},
         Arc,
     },
+    time::Duration,
 };
 
 use std::{convert::TryInto, io::Error as IoError};
@@ -24,6 +25,11 @@ use crate::{
 
 use crate::EventType;
 use serde_json::Value;
+
+/// How many events a reindex adds to the index before it commits.
+const REINDEX_COMMIT_RATE: usize = 2000;
+/// How long a reindex waits between commits if not enough events were added.
+const REINDEX_COMMIT_TIME: Duration = Duration::from_secs(20);
 
 /// Database that can be used to reindex the events.
 ///
@@ -269,7 +275,10 @@ impl RecoveryDatabase {
         }
 
         let index = Index::new(&self.path, &self.config)?;
-        let writer = index.get_writer()?;
+        let mut writer = index.get_writer()?;
+        // Nobody can search the index during a reindex, so we can commit
+        // less often. Fewer and larger commits make the reindex faster.
+        writer.set_commit_rate(REINDEX_COMMIT_RATE, REINDEX_COMMIT_TIME);
         self.index = Some(index);
         self.index_writer = Some(writer);
 

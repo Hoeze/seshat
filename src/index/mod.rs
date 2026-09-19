@@ -119,6 +119,10 @@ pub(crate) struct Writer {
 
     commit_timestamp: std::time::Instant,
     room_id_field: tv::schema::Field,
+
+    /// Commit once this many events are pending, or after this much time.
+    commit_rate: usize,
+    commit_time: Duration,
 }
 
 impl Writer {
@@ -129,8 +133,8 @@ impl Writer {
     fn commit_helper(&mut self, force: bool) -> Result<bool, tv::TantivyError> {
         if self.events_pending_commit > 0
             && (force
-                || self.events_pending_commit >= COMMIT_RATE
-                || self.commit_timestamp.elapsed() >= COMMIT_TIME)
+                || self.events_pending_commit >= self.commit_rate
+                || self.commit_timestamp.elapsed() >= self.commit_time)
         {
             self.inner.commit()?;
             self.events_pending_commit = 0;
@@ -144,6 +148,18 @@ impl Writer {
     pub fn force_commit(&mut self) -> Result<(), tv::TantivyError> {
         self.commit_helper(true)?;
         Ok(())
+    }
+
+    /// Change how often `commit()` commits, instead of `COMMIT_RATE` and
+    /// `COMMIT_TIME`.
+    ///
+    /// # Arguments
+    ///
+    /// * `events` - Commit once this many events are pending.
+    /// * `time` - Commit once this much time passed since the last commit.
+    pub fn set_commit_rate(&mut self, events: usize, time: Duration) {
+        self.commit_rate = events;
+        self.commit_time = time;
     }
 
     pub fn add_event(&mut self, event: &Event) -> Result<(), tv::TantivyError> {
@@ -564,6 +580,8 @@ impl Index {
             date_field: self.date_field,
             events_pending_commit: 0,
             commit_timestamp: std::time::Instant::now(),
+            commit_rate: COMMIT_RATE,
+            commit_time: COMMIT_TIME,
         })
     }
 }
@@ -810,6 +828,22 @@ fn event_count() {
 
     writer.force_commit().unwrap();
     assert_eq!(writer.events_pending_commit, 0);
+}
+
+#[test]
+fn custom_commit_rate() {
+    let tmpdir = TempDir::new().unwrap();
+    let config = Config::new().set_language(&Language::English);
+    let index = Index::new(&tmpdir, &config).unwrap();
+
+    let mut writer = index.get_writer().unwrap();
+    writer.set_commit_rate(2, Duration::from_secs(3600));
+
+    writer.add_event(&EVENT).unwrap();
+    assert!(!writer.commit().unwrap());
+
+    writer.add_event(&TOPIC_EVENT).unwrap();
+    assert!(writer.commit().unwrap());
 }
 
 #[test]
