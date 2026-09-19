@@ -434,8 +434,13 @@ impl Index {
         // Register tokenizer based on mode
         match &config.tokenizer_mode {
             TokenizerMode::Ngram { min_gram, max_gram } => {
-                let ngram_tokenizer =
-                    tv::tokenizer::NgramTokenizer::new(*min_gram, *max_gram, false)?;
+                // Lowercase the n-grams, so that search is case-insensitive
+                // like in the language-based mode.
+                let ngram_tokenizer = tv::tokenizer::TextAnalyzer::builder(
+                    tv::tokenizer::NgramTokenizer::new(*min_gram, *max_gram, false)?,
+                )
+                .filter(tv::tokenizer::LowerCaser)
+                .build();
                 index
                     .tokenizers()
                     .register(&tokenizer_name, ngram_tokenizer);
@@ -896,6 +901,33 @@ fn ngram_tokenizer_mode() {
 
     assert_eq!(result.len(), 1);
     assert_eq!(result[0].1, EVENT.event_id);
+}
+
+#[test]
+fn ngram_tokenizer_is_case_insensitive() {
+    let tmpdir = TempDir::new().unwrap();
+    let config = Config::new().use_ngram_tokenizer(2, 4);
+    let index = Index::new(&tmpdir, &config).unwrap();
+
+    let mut event = EVENT.clone();
+    event.content_value = "Der Maschinenbau-Kurs nutzt Kubernetes".to_string();
+
+    let mut writer = index.get_writer().unwrap();
+    writer.add_event(&event).unwrap();
+    writer.force_commit().unwrap();
+    index.reload().unwrap();
+
+    let searcher = index.get_searcher();
+
+    for term in &["maschine", "MASCHINE", "kubernetes", "KUBERNETES", "bernet"] {
+        let result = searcher.search(term, &Default::default()).unwrap().results;
+        assert_eq!(
+            result.len(),
+            1,
+            "Search for {:?} didn't find the event",
+            term
+        );
+    }
 }
 
 #[test]

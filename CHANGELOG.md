@@ -30,6 +30,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - The room filter is a separate query now, so a search term can't escape it
   anymore.
 
+- Search in the N-gram tokenizer mode is case-insensitive now, like in the
+  language-based mode. For example, `kubernetes` finds "Kubernetes". Existing
+  N-gram indexes get rebuilt anyway, because of the Tantivy upgrade.
+
 ## 6.0.1 - 2026-09-11
 
 - Fix the npm publish jobs failing to find `.node-version`.
