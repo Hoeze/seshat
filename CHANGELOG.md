@@ -65,6 +65,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   count of a search counts the events before the check, so it can be higher
   than the number of results.
 
+- The events before and after a search result load through an index now,
+  instead of scanning every event of the room. A search that asks for
+  context in a room with 30,000 events took 39 ms and takes 0.7 ms. The
+  queries combined their conditions with `&`, a bitwise AND, which SQLite
+  can't answer from an index. `before_limit` works again as well: it used
+  to take its number from `after_limit`.
+
 - An index whose fields don't match the ones seshat builds asks for a
   reindex now, instead of failing to open. A database version that someone
   forgot to raise used to break the index until the user deleted it.
