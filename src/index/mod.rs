@@ -67,6 +67,14 @@ const COMMIT_RATE: usize = 500;
 /// committed.
 const COMMIT_TIME: Duration = Duration::from_secs(5);
 
+/// The tokenizer of the field that matches inside words.
+const GRAM_TOKENIZER: &str = "seshat_grams";
+/// How long the groups of characters in that field are, and so the shortest
+/// search term that matches inside words. Three is what SQLite and
+/// PostgreSQL use for their substring indexes. Pairs appear in almost every
+/// message, which makes them expensive to search and useless to find.
+const GRAM_SIZE: usize = 3;
+
 /// How many searches should be cached so pagination is supported.
 const SEARCH_CACHE_SIZE: usize = 100;
 /// How much should the result limit increase every time we need to find more
@@ -85,12 +93,15 @@ pub(crate) struct Index {
     body_field: tv::schema::Field,
     topic_field: tv::schema::Field,
     name_field: tv::schema::Field,
+    substring_field: tv::schema::Field,
     event_id_field: tv::schema::Field,
     sender_field: tv::schema::Field,
     date_field: tv::schema::Field,
     room_id_field: tv::schema::Field,
     /// The index holds whole words, not N-grams.
     word_tokens: bool,
+    /// The index holds the stems of words, not the words themselves.
+    stemmed: bool,
     search_cache: Arc<RwLock<LruCache<Uuid, Search>>>,
 }
 
@@ -98,7 +109,39 @@ pub(crate) struct Index {
 struct Search {
     search_term: Arc<String>,
     search_config: Arc<SearchConfig>,
+    matching: Matching,
     event_ids: Arc<Vec<String>>,
+}
+
+/// What a search matches besides the exact words. A search widens this step
+/// by step, as long as it finds nothing.
+#[derive(Clone, Copy, Default)]
+struct Matching {
+    typos: bool,
+    substring: bool,
+}
+
+/// Whether the text of an event holds every word of one of the
+/// alternatives, which is what a match inside words claims.
+///
+/// The words are normalized already, so the text is normalized the same way
+/// before the two are compared.
+fn holds_needles(
+    folder: &mut tv::tokenizer::TextAnalyzer,
+    text: &str,
+    needles: &search_syntax::Needles,
+) -> bool {
+    let mut stream = folder.token_stream(text);
+
+    let Some(token) = stream.next() else {
+        return false;
+    };
+
+    let folded = &token.text;
+
+    needles
+        .iter()
+        .any(|alternative| alternative.iter().all(|needle| folded.contains(needle)))
 }
 
 #[derive(Debug)]
@@ -110,7 +153,9 @@ pub(crate) struct SearchResult {
 
 /// One page of a search of the index.
 struct Page {
-    /// How many events the query matched.
+    /// How many events the query matched. A word that matches inside words
+    /// is counted before the check against the text of an event, so this is
+    /// an upper bound then.
     count: usize,
     /// The events of this page, with their score.
     results: Vec<(f32, EventId)>,
@@ -123,6 +168,7 @@ pub(crate) struct Writer {
     body_field: tv::schema::Field,
     topic_field: tv::schema::Field,
     name_field: tv::schema::Field,
+    substring_field: tv::schema::Field,
     event_id_field: tv::schema::Field,
     sender_field: tv::schema::Field,
     date_field: tv::schema::Field,
@@ -184,6 +230,8 @@ impl Writer {
             EventType::Name => doc.add_text(self.name_field, &event.content_value),
         }
 
+        doc.add_text(self.substring_field, &event.content_value);
+
         doc.add_text(self.event_id_field, &event.event_id);
         doc.add_text(self.room_id_field, &event.room_id);
         doc.add_text(self.sender_field, &event.sender);
@@ -214,12 +262,14 @@ pub(crate) struct IndexSearcher {
     body_field: tv::schema::Field,
     topic_field: tv::schema::Field,
     name_field: tv::schema::Field,
+    substring_field: tv::schema::Field,
     room_id_field: tv::schema::Field,
     #[allow(dead_code)]
     sender_field: tv::schema::Field,
     date_field: tv::schema::Field,
     event_id_field: tv::schema::Field,
     word_tokens: bool,
+    stemmed: bool,
     search_cache: Arc<RwLock<LruCache<Uuid, Search>>>,
 }
 
@@ -228,8 +278,8 @@ impl IndexSearcher {
         &self,
         term: &str,
         config: &SearchConfig,
-        typos: bool,
-    ) -> Result<Box<dyn tv::query::Query>, tv::TantivyError> {
+        matching: Matching,
+    ) -> Result<(Box<dyn tv::query::Query>, search_syntax::Needles), tv::TantivyError> {
         let mut keys = Vec::new();
 
         if config.keys.is_empty() {
@@ -248,6 +298,8 @@ impl IndexSearcher {
             }
         }
 
+        let mut needles = search_syntax::Needles::new();
+
         let query: Box<dyn tv::query::Query> = if term.is_empty() {
             Box::new(tv::query::AllQuery)
         } else {
@@ -264,22 +316,39 @@ impl IndexSearcher {
             } else {
                 // N-grams match parts of words anyway, and typos in N-grams
                 // make no sense.
-                let mut fuzziness =
-                    (self.word_tokens && (config.prefix_search || typos)).then(|| {
-                        search_syntax::Fuzziness {
+                let extra = config.prefix_search || matching.typos || matching.substring;
+                let mut fuzziness = (self.word_tokens && extra)
+                    .then(|| -> Result<_, tv::TantivyError> {
+                        Ok(search_syntax::Fuzziness {
                             fields: keys,
                             normalizer: Index::word_normalizer(),
+                            substring_field: self.substring_field,
+                            grams: Index::gram_tokenizer()?,
+                            folder: Index::folder(),
                             prefix: config.prefix_search,
-                            typos,
-                        }
-                    });
-                search_syntax::parse(&query_parser, term, fuzziness.as_mut())?
+                            typos: matching.typos,
+                            substring: matching.substring,
+                            // A stem or a typo matches a word that the text
+                            // doesn't hold, so the text can't be checked.
+                            verify: !self.stemmed && !matching.typos,
+                            needles: Default::default(),
+                            current: Default::default(),
+                        })
+                    })
+                    .transpose()?;
+                let query = search_syntax::parse(&query_parser, term, fuzziness.as_mut())?;
+
+                if let Some(fuzziness) = fuzziness.as_mut() {
+                    needles = fuzziness.take_needles();
+                }
+
+                query
             }
         };
 
         // Add the room filter as a query, not as query syntax, so that the
         // search term can't change what the filter means.
-        Ok(match &config.room_id {
+        let query = match &config.room_id {
             Some(room) => {
                 let room = tv::query::TermQuery::new(
                     Term::from_field_text(self.room_id_field, room),
@@ -291,7 +360,9 @@ impl IndexSearcher {
                 ]))
             }
             None => query,
-        })
+        };
+
+        Ok((query, needles))
     }
 
     fn search_helper(
@@ -301,6 +372,7 @@ impl IndexSearcher {
         order_by_recency: bool,
         previous_results: &[EventId],
         query: &dyn tv::query::Query,
+        needles: &search_syntax::Needles,
     ) -> Result<Page, tv::TantivyError> {
         let mut multicollector = MultiCollector::new();
         let count_handle = multicollector.add_collector(Count);
@@ -331,6 +403,9 @@ impl IndexSearcher {
 
         let mut docs = Vec::new();
         let mut event_ids = Vec::new();
+        // The groups of characters of a word can all sit in an event that
+        // doesn't hold the word. Reading the text back sorts those out.
+        let mut folder = (!needles.is_empty()).then(Index::folder);
 
         let count = count_handle.extract(&mut result);
 
@@ -352,6 +427,17 @@ impl IndexSearcher {
                 continue;
             }
 
+            if let Some(folder) = folder.as_mut() {
+                let text = doc
+                    .get_first(self.substring_field)
+                    .and_then(|value| value.as_str())
+                    .unwrap_or_default();
+
+                if !holds_needles(folder, text, needles) {
+                    continue;
+                }
+            }
+
             event_ids.push(event_id.clone());
             docs.push((score, event_id));
 
@@ -369,6 +455,7 @@ impl IndexSearcher {
                 order_by_recency,
                 previous_results,
                 query,
+                needles,
             );
         }
 
@@ -391,9 +478,10 @@ impl IndexSearcher {
             None
         };
 
-        let (page, term, config) = if let Some(past_search) = past_search {
-            let typos = past_search.search_config.typo_tolerance == TypoTolerance::Always;
-            let query = self.parse_query(term, &past_search.search_config, typos)?;
+        let (page, term, config, matching) = if let Some(past_search) = past_search {
+            // The next pages have to come from the same search.
+            let matching = past_search.matching;
+            let (query, needles) = self.parse_query(term, &past_search.search_config, matching)?;
             let previous_results = &past_search.event_ids;
 
             let mut page = self.search_helper(
@@ -402,6 +490,7 @@ impl IndexSearcher {
                 config.order_by_recency,
                 previous_results,
                 &query,
+                &needles,
             )?;
 
             // Add the previous results to the current ones.
@@ -411,35 +500,46 @@ impl IndexSearcher {
                 page,
                 past_search.search_term.clone(),
                 past_search.search_config.clone(),
+                matching,
             )
         } else {
-            let mut config = config.clone();
-            let typos = config.typo_tolerance == TypoTolerance::Always;
-            let query = self.parse_query(term, &config, typos)?;
-            let mut page = self.search_helper(
-                config.limit,
-                config.limit,
-                config.order_by_recency,
-                &[],
-                &query,
-            )?;
+            let mut matching = Matching {
+                typos: config.typo_tolerance == TypoTolerance::Always,
+                // Matching inside words never misses an event that contains
+                // the search term, so it runs right away.
+                substring: config.substring_search,
+            };
 
-            // Only search with typos if the search without them found nothing.
-            if page.count == 0 && config.typo_tolerance == TypoTolerance::Fallback {
-                let query = self.parse_query(term, &config, true)?;
-                page = self.search_helper(
+            let search = |matching| -> Result<_, tv::TantivyError> {
+                let (query, needles) = self.parse_query(term, config, matching)?;
+                self.search_helper(
                     config.limit,
                     config.limit,
                     config.order_by_recency,
                     &[],
                     &query,
-                )?;
+                    &needles,
+                )
+            };
 
-                // The next pages have to come from the same search.
-                config.typo_tolerance = TypoTolerance::Always;
+            let mut page = search(matching)?;
+
+            // Only search with typos if the search finds nothing without
+            // them. They bring in events that don't contain the search term.
+            //
+            // The results decide, not the count, because the count is taken
+            // before the check against the text of an event.
+            if page.results.is_empty() && config.typo_tolerance == TypoTolerance::Fallback {
+                matching.typos = true;
+                page = search(matching)?;
             }
 
-            (page, Arc::new(term.to_owned()), Arc::new(config))
+            (
+                page,
+                Arc::new(term.to_owned()),
+                Arc::new(config.clone()),
+                matching,
+            )
         };
 
         let next_batch = if page.event_ids.len() == page.count {
@@ -449,6 +549,7 @@ impl IndexSearcher {
             let search = Search {
                 search_term: term,
                 search_config: config,
+                matching,
                 event_ids: Arc::new(page.event_ids),
             };
 
@@ -477,6 +578,22 @@ impl Index {
         let topic_field = schemabuilder.add_text_field("topic", text_field_options.clone());
         let name_field = schemabuilder.add_text_field("name", text_field_options);
 
+        // Holds the text of every event as groups of characters, for
+        // matching inside words. Only the event ids are indexed, which is the
+        // smallest form Tantivy has, so the field can't rank or match
+        // phrases. The text is stored as well, so that a search can read it
+        // back and drop the events that hold all the groups of a word
+        // without holding the word.
+        let substring_indexing = tv::schema::TextFieldIndexing::default()
+            .set_tokenizer(GRAM_TOKENIZER)
+            .set_index_option(tv::schema::IndexRecordOption::Basic);
+        let substring_field = schemabuilder.add_text_field(
+            "substring",
+            tv::schema::TextOptions::default()
+                .set_indexing_options(substring_indexing)
+                .set_stored(),
+        );
+
         let date_field = schemabuilder.add_u64_field("date", tv::schema::FAST);
 
         let sender_field = schemabuilder.add_text_field("sender", tv::schema::STRING);
@@ -490,6 +607,10 @@ impl Index {
 
         let index = Index::open_index(path, config, schema)?;
         let reader = index.reader()?;
+
+        index
+            .tokenizers()
+            .register(GRAM_TOKENIZER, Index::gram_tokenizer()?);
 
         // Register tokenizer based on mode. Both modes fold accents, so that
         // e.g. "cafe" finds "Café".
@@ -527,11 +648,13 @@ impl Index {
             body_field,
             topic_field,
             name_field,
+            substring_field,
             event_id_field,
             sender_field,
             date_field,
             room_id_field,
             word_tokens: config.tokenizer_mode == TokenizerMode::LanguageBased,
+            stemmed: !matches!(config.language, Language::Unknown),
             search_cache: Arc::new(RwLock::new(LruCache::new(SEARCH_CACHE_SIZE))),
         })
     }
@@ -540,8 +663,14 @@ impl Index {
     /// Japanese and Korean text into pairs of characters.
     ///
     /// This is the tokenizer of the language-based mode without a language.
-    /// Prefixes and typos are matched against words normalized like this in
-    /// every language, because stemming a partial word makes no sense.
+    /// Prefixes, typos and matches inside words work with words normalized
+    /// like this in every language, because stemming a partial word makes no
+    /// sense.
+    ///
+    /// With a language, the index holds stems, and a prefix that reaches
+    /// past the stem finds nothing: "runnin" misses an indexed "run". The
+    /// whole word still matches, because the query parser stems it too.
+    /// Element configures no language.
     fn word_normalizer() -> tv::tokenizer::TextAnalyzer {
         tv::tokenizer::TextAnalyzer::builder(script_tokenizer::ScriptTokenizer)
             .filter(tv::tokenizer::RemoveLongFilter::limit(40))
@@ -593,6 +722,36 @@ impl Index {
         Ok(())
     }
 
+    /// Cut text into groups of [`GRAM_SIZE`] characters, lowercase and
+    /// without accents.
+    ///
+    /// The groups run across spaces and punctuation, so a search can match
+    /// anywhere in the text. A search term of at least that many characters
+    /// matches every event that contains it, and some that only contain all
+    /// of its groups. Those are sorted out by reading the text back.
+    fn gram_tokenizer() -> Result<tv::tokenizer::TextAnalyzer, tv::TantivyError> {
+        Ok(
+            tv::tokenizer::TextAnalyzer::builder(tv::tokenizer::NgramTokenizer::new(
+                GRAM_SIZE, GRAM_SIZE, false,
+            )?)
+            .filter(tv::tokenizer::LowerCaser)
+            .filter(tv::tokenizer::AsciiFoldingFilter)
+            .build(),
+        )
+    }
+
+    /// Lowercase a whole text and drop its accents, the way a group of
+    /// characters is normalized.
+    ///
+    /// A search normalizes its word this way as well, so checking whether
+    /// the text of an event holds the word compares like for like.
+    fn folder() -> tv::tokenizer::TextAnalyzer {
+        tv::tokenizer::TextAnalyzer::builder(tv::tokenizer::RawTokenizer::default())
+            .filter(tv::tokenizer::LowerCaser)
+            .filter(tv::tokenizer::AsciiFoldingFilter)
+            .build()
+    }
+
     fn create_text_options(tokenizer: &str) -> tv::schema::TextOptions {
         let indexing = tv::schema::TextFieldIndexing::default()
             .set_tokenizer(tokenizer)
@@ -612,11 +771,13 @@ impl Index {
             body_field: self.body_field,
             topic_field: self.topic_field,
             name_field: self.name_field,
+            substring_field: self.substring_field,
             room_id_field: self.room_id_field,
             sender_field: self.sender_field,
             date_field: self.date_field,
             event_id_field: self.event_id_field,
             word_tokens: self.word_tokens,
+            stemmed: self.stemmed,
             search_cache: self.search_cache.clone(),
         }
     }
@@ -633,6 +794,7 @@ impl Index {
             body_field: self.body_field,
             topic_field: self.topic_field,
             name_field: self.name_field,
+            substring_field: self.substring_field,
             event_id_field: self.event_id_field,
             room_id_field: self.room_id_field,
             sender_field: self.sender_field,
@@ -1145,6 +1307,204 @@ fn typo_tolerance() {
     assert_eq!(count("cluster", TypoTolerance::Always), 2);
     assert_eq!(count("cluster", TypoTolerance::Fallback), 1);
     assert_eq!(count("kubernets", TypoTolerance::Fallback), 1);
+}
+
+#[test]
+fn substring_search() {
+    let tmpdir = TempDir::new().unwrap();
+    let index = Index::new(&tmpdir, &Config::new()).unwrap();
+
+    let mut event = EVENT.clone();
+    event.content_value = "Our Kubernetes cluster is down".to_string();
+
+    let mut writer = index.get_writer().unwrap();
+    writer.add_event(&event).unwrap();
+    writer.force_commit().unwrap();
+    index.reload().unwrap();
+
+    let searcher = index.get_searcher();
+    let finds = |term: &str, substring: bool| {
+        let mut config = SearchConfig::new();
+        config.substring_search(substring);
+        !searcher.search(term, &config).unwrap().results.is_empty()
+    };
+
+    // Words match inside words, from 3 characters on.
+    assert!(finds("bernet", true));
+    assert!(!finds("bernet", false));
+    assert!(finds("ern", true));
+    assert!(!finds("er", true));
+
+    // Whole words still match without the option.
+    assert!(finds("cluster", false));
+
+    // A phrase matches across spaces, a word on its own doesn't.
+    assert!(finds("\"es clu\"", true));
+    assert!(!finds("es clu", true));
+}
+
+#[test]
+fn matching_inside_words_checks_the_text() {
+    let tmpdir = TempDir::new().unwrap();
+    let index = Index::new(&tmpdir, &Config::new()).unwrap();
+
+    let mut writer = index.get_writer().unwrap();
+
+    for (i, body) in ["the form is here", "for the norm", "Kubernetes in a Café"]
+        .iter()
+        .enumerate()
+    {
+        let mut event = EVENT.clone();
+        event.event_id = format!("$form{}:example.org", i);
+        event.content_value = body.to_string();
+        writer.add_event(&event).unwrap();
+    }
+
+    writer.force_commit().unwrap();
+    index.reload().unwrap();
+
+    let searcher = index.get_searcher();
+    let found = |term: &str, config: &SearchConfig| -> Vec<String> {
+        searcher
+            .search(term, config)
+            .unwrap()
+            .results
+            .into_iter()
+            .map(|(_, event_id)| event_id)
+            .collect()
+    };
+
+    let mut config = SearchConfig::new();
+    config.substring_search(true);
+
+    // "for the norm" holds "for" and "orm", the groups of 3 characters of
+    // "form", without holding the word. Reading the text back sorts it out.
+    assert_eq!(found("form", &config), ["$form0:example.org"]);
+
+    // Words that do sit inside a word still match, accents and all.
+    assert_eq!(found("bernet", &config), ["$form2:example.org"]);
+    assert_eq!(found("cafe", &config), ["$form2:example.org"]);
+
+    // Each alternative is checked on its own.
+    assert_eq!(found("form or bernet", &config).len(), 2);
+
+    // A prefix matches the start of a word, which is in the text as well.
+    config.prefix_search(true);
+    assert_eq!(found("kuber", &config), ["$form2:example.org"]);
+
+    // A typo matches a word the text doesn't hold, so nothing is checked.
+    config.typo_tolerance(TypoTolerance::Always);
+    assert_eq!(found("kubernets", &config), ["$form2:example.org"]);
+}
+
+#[test]
+fn operators_while_typing() {
+    let tmpdir = TempDir::new().unwrap();
+    let index = Index::new(&tmpdir, &Config::new()).unwrap();
+
+    let mut event = EVENT.clone();
+    event.content_value = "An orange android".to_string();
+
+    let mut writer = index.get_writer().unwrap();
+    writer.add_event(&event).unwrap();
+    writer.force_commit().unwrap();
+    index.reload().unwrap();
+
+    let searcher = index.get_searcher();
+    let finds = |term: &str, prefix: bool| {
+        let mut config = SearchConfig::new();
+        config.prefix_search(prefix);
+        !searcher.search(term, &config).unwrap().results.is_empty()
+    };
+
+    // The word the user is typing is a word, not an operator. Otherwise the
+    // results vanish on the second keystroke of "orange".
+    for term in &["or", "and"] {
+        assert!(
+            finds(term, true),
+            "Search for {:?} didn't find the event",
+            term
+        );
+        assert!(!finds(term, false), "Search for {:?} found the event", term);
+    }
+
+    // Followed by whitespace or by another word, they are operators.
+    assert!(!finds("or ", true));
+    assert!(!finds("and ", true));
+    assert!(finds("orange or nothing", true));
+    assert!(finds("orange and android", true));
+    assert!(!finds("nothing or missing", true));
+}
+
+#[test]
+fn the_typo_fallback_looks_at_the_results() {
+    let tmpdir = TempDir::new().unwrap();
+    let index = Index::new(&tmpdir, &Config::new()).unwrap();
+
+    let mut writer = index.get_writer().unwrap();
+
+    for (id, body) in [("$norms", "for the norms"), ("$form", "the form")] {
+        let mut event = EVENT.clone();
+        event.event_id = format!("{}:example.org", id);
+        event.content_value = body.to_string();
+        writer.add_event(&event).unwrap();
+    }
+
+    writer.force_commit().unwrap();
+    index.reload().unwrap();
+
+    let searcher = index.get_searcher();
+    let found = |typos| -> Vec<String> {
+        let mut config = SearchConfig::new();
+        config.substring_search(true);
+        config.typo_tolerance(typos);
+        searcher
+            .search("forms", &config)
+            .unwrap()
+            .results
+            .into_iter()
+            .map(|(_, event_id)| event_id)
+            .collect()
+    };
+
+    // "for the norms" holds "for", "orm" and "rms", the groups of 3
+    // characters of "forms", without holding the word. So the search finds
+    // nothing, while the count before the check is 1.
+    assert!(found(TypoTolerance::Off).is_empty());
+
+    // The fallback has to go by the results, not by that count.
+    assert!(found(TypoTolerance::Fallback).contains(&"$form:example.org".to_string()));
+}
+
+#[test]
+fn substring_search_finds_events_that_other_matches_hide() {
+    let tmpdir = TempDir::new().unwrap();
+    let index = Index::new(&tmpdir, &Config::new()).unwrap();
+
+    let mut writer = index.get_writer().unwrap();
+
+    for (i, body) in ["šleeep", "leeway to the meeting"].iter().enumerate() {
+        let mut event = EVENT.clone();
+        event.event_id = format!("$lee{}:example.org", i);
+        event.content_value = body.to_string();
+        writer.add_event(&event).unwrap();
+    }
+
+    writer.force_commit().unwrap();
+    index.reload().unwrap();
+
+    let searcher = index.get_searcher();
+    let count = |term: &str| {
+        let mut config = SearchConfig::new();
+        config.prefix_search(true).substring_search(true);
+        searcher.search(term, &config).unwrap().count
+    };
+
+    // "lee" starts "leeway" and sits inside "šleeep", which is indexed as
+    // "sleeep". Both match, the word match doesn't hide the other one.
+    assert_eq!(count("lee"), 2);
+    assert_eq!(count("leee"), 1);
+    assert_eq!(count("way"), 1);
 }
 
 #[test]

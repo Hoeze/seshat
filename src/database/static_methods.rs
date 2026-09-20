@@ -306,6 +306,19 @@ impl Database {
             version = 5;
         }
 
+        // The index holds the text of every event as groups of characters
+        // now, which an index written before doesn't have.
+        if version == 5 {
+            let transaction = connection.transaction()?;
+
+            transaction.execute("UPDATE reindex_needed SET reindex_needed = ?1", [true])?;
+            transaction.execute("UPDATE version SET version = '6'", [])?;
+            transaction.commit()?;
+
+            reindex_needed = true;
+            version = 6;
+        }
+
         Ok((version, reindex_needed))
     }
 

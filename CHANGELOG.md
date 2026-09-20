@@ -46,6 +46,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   The Node bindings take `prefix_search` and `typo_tolerance`. Both options
   only work with the default syntax in the language-based tokenizer mode.
 
+- `SearchConfig::substring_search()`, or `substring_search` in the Node
+  bindings, lets words match inside words. For example, `bernet` finds
+  "Kubernetes", and the phrase `"es clu"` finds "Kubernetes cluster". The
+  index holds the text of every event as groups of 3 characters for this,
+  and a search requires all groups of a word or phrase. No event that
+  contains the search term is missed that way, while events that only
+  contain all of its groups match as well. A search reads the text of every
+  result back and drops those, so a word finds exactly the events that hold
+  it. Words and phrases need at least 3 characters, the limit SQLite and
+  PostgreSQL use for their substring indexes. The database version goes up
+  to 6 for the new field, so an existing index gets rebuilt from the events
+  in the database.
+
+- The check against the text only runs where a match really means that the
+  word appears: not for phrases, not with a language set, whose index holds
+  stems instead of words, and not while words may match with typos. The
+  count of a search counts the events before the check, so it can be higher
+  than the number of results.
+
 - The language-based tokenizer mode indexes Chinese, Japanese and Korean
   text as overlapping pairs of characters now. Those languages write without
   spaces between words, so a word tokenizer used to turn a whole sentence

@@ -37,6 +37,7 @@ pub struct SearchConfig {
     pub(crate) query_syntax: bool,
     pub(crate) prefix_search: bool,
     pub(crate) typo_tolerance: TypoTolerance,
+    pub(crate) substring_search: bool,
 }
 
 /// When the words of a search term may match with typos.
@@ -190,6 +191,29 @@ impl SearchConfig {
         self.typo_tolerance = typo_tolerance;
         self
     }
+
+    /// Should words also match inside words.
+    ///
+    /// For example, `bernet` finds "Kubernetes", and the phrase `"es clu"`
+    /// finds "Kubernetes cluster". Words and phrases need at least 3
+    /// characters for that, the limit SQLite and PostgreSQL use for their
+    /// substring indexes. Words are matched one by one, so only a phrase
+    /// matches across spaces.
+    ///
+    /// The index holds the text of every event as groups of 3 characters,
+    /// and a search requires all groups of the word or phrase. So no event
+    /// that contains it is missed, while a few events that only contain all
+    /// of its groups match as well. Excluded words still have to match
+    /// exactly. Only the default syntax in the language-based tokenizer mode
+    /// supports this.
+    ///
+    /// # Arguments
+    ///
+    /// * `substring_search` - Flag to determine if words match inside words.
+    pub fn substring_search(&mut self, substring_search: bool) -> &mut Self {
+        self.substring_search = substring_search;
+        self
+    }
 }
 
 impl Default for SearchConfig {
@@ -205,6 +229,7 @@ impl Default for SearchConfig {
             query_syntax: false,
             prefix_search: false,
             typo_tolerance: TypoTolerance::Off,
+            substring_search: false,
         }
     }
 }

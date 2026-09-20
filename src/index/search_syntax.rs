@@ -20,8 +20,9 @@ use std::mem;
 use tantivy::{
     query::{
         BooleanQuery, EmptyQuery, FuzzyTermQuery, Occur, PhrasePrefixQuery, Query, QueryParser,
+        TermQuery,
     },
-    schema::Field,
+    schema::{Field, IndexRecordOption},
     tokenizer::{TextAnalyzer, TokenStream},
     TantivyError, Term,
 };
@@ -32,6 +33,11 @@ type Clauses = Vec<(Occur, Box<dyn Query>)>;
 /// has a word that starts with a given character.
 const MIN_PREFIX_CHARS: usize = 2;
 
+/// The words an event has to contain for a match inside words to be real,
+/// one list per alternative of the search term. An event that holds every
+/// word of any one list contains what was searched for.
+pub(crate) type Needles = Vec<Vec<String>>;
+
 /// Matches beyond the exact words, for a search that runs while the user
 /// types.
 pub(crate) struct Fuzziness {
@@ -39,10 +45,26 @@ pub(crate) struct Fuzziness {
     pub(crate) fields: Vec<Field>,
     /// Splits and normalizes a word like the indexed text, without stemming.
     pub(crate) normalizer: TextAnalyzer,
+    /// The field that holds the text as groups of characters.
+    pub(crate) substring_field: Field,
+    /// Cuts text into the same groups of characters as that field.
+    pub(crate) grams: TextAnalyzer,
+    /// Normalizes a whole text the way those groups are normalized.
+    pub(crate) folder: TextAnalyzer,
     /// The last word also matches as the start of a word.
     pub(crate) prefix: bool,
     /// Words also match with typos.
     pub(crate) typos: bool,
+    /// Words also match inside words.
+    pub(crate) substring: bool,
+    /// Whether a word that matches inside words has to appear in the text of
+    /// the event. A stemmer or a typo makes a match that doesn't, so both
+    /// turn this off.
+    pub(crate) verify: bool,
+    /// The alternatives that are parsed already. Starts empty.
+    pub(crate) needles: Needles,
+    /// The alternative that is being parsed. Starts empty.
+    pub(crate) current: Vec<String>,
 }
 
 impl Fuzziness {
@@ -53,6 +75,73 @@ impl Fuzziness {
             tokens.push(token.text.clone());
         }
         tokens
+    }
+
+    /// The text lowercased and without accents.
+    fn fold(&mut self, text: &str) -> String {
+        let mut stream = self.folder.token_stream(text);
+        match stream.next() {
+            Some(token) => token.text.clone(),
+            None => String::new(),
+        }
+    }
+
+    /// Remember that the text has to appear in an event, if a match inside
+    /// words really does mean that it appears.
+    ///
+    /// Only text that survives the tokenizer as one token qualifies. Text
+    /// the tokenizer cuts matches events that write it differently, and
+    /// those don't hold the text itself: "e-mail" also matches "e mail",
+    /// the phrase `"one two"` also matches "one, two", and CJK text becomes
+    /// pairs of characters. Those go unchecked, and keep the events that
+    /// hold their groups of characters in another order.
+    fn needle(&mut self, text: &str, tokens: &[String]) {
+        if !self.verify {
+            return;
+        }
+
+        let folded = self.fold(text);
+
+        if tokens.len() == 1 && tokens[0] == folded {
+            self.current.push(folded);
+        }
+    }
+
+    /// Close the alternative that is being parsed.
+    fn close(&mut self) {
+        self.needles.push(mem::take(&mut self.current));
+    }
+
+    /// The words to check the text of an event against.
+    ///
+    /// Empty when nothing can be checked, so that a search that matches
+    /// inside words without a word to check keeps every event it finds.
+    ///
+    /// One alternative without a word does the same for the whole term,
+    /// because nothing says which alternative an event matched. So
+    /// `form or "es clu"` keeps what `form` on its own would drop. Keeping
+    /// an event too many beats dropping one the user searched for.
+    pub(crate) fn take_needles(&mut self) -> Needles {
+        let needles = mem::take(&mut self.needles);
+
+        if needles.iter().all(|alternative| alternative.is_empty()) {
+            return Needles::new();
+        }
+
+        needles
+    }
+
+    /// The groups of characters of the text, without duplicates. Text that
+    /// is shorter than one group has none.
+    fn grams(&mut self, text: &str) -> Vec<String> {
+        let mut stream = self.grams.token_stream(text);
+        let mut grams = Vec::new();
+        while let Some(token) = stream.next() {
+            grams.push(token.text.clone());
+        }
+        grams.sort();
+        grams.dedup();
+        grams
     }
 }
 
@@ -69,8 +158,12 @@ impl Fuzziness {
 /// Synapse, words are only split at whitespace. The tokenizer of the index
 /// handles punctuation, the same way it does for the indexed text.
 ///
-/// With `fuzziness`, words may also match as a prefix or with typos. Phrases
-/// and excluded words always match exactly.
+/// With `fuzziness`, words may also match as a prefix or with typos. A typo
+/// needs a word the tokenizer keeps whole, so "e-mail" and CJK text match
+/// exactly. Phrases and excluded words always match exactly as well.
+///
+/// The word at the end is the one the user is typing, unless the term ends
+/// with whitespace, so `or` and `and` are ordinary words there.
 pub(crate) fn parse(
     parser: &QueryParser,
     term: &str,
@@ -85,7 +178,11 @@ pub(crate) fn parse(
     for (i, part) in parts.iter().enumerate() {
         // Every second part was between quotes.
         if i % 2 == 1 {
-            add_clause(parser, &mut clauses, part, mem::take(&mut exclude))?;
+            let exclude = mem::take(&mut exclude);
+            // A phrase matches as text as well, spaces and punctuation
+            // included, so `"es clu"` finds "Kubernetes cluster".
+            let inside = fuzziness.as_deref_mut().filter(|_| !exclude);
+            add_clause(parser, &mut clauses, part, exclude, inside)?;
             continue;
         }
 
@@ -98,27 +195,36 @@ pub(crate) fn parse(
                 && j == words.len() - 1
                 && !part.ends_with(char::is_whitespace);
 
+            // A word that is still being typed is the start of a word, not
+            // an operator. Otherwise the results vanish on the second
+            // keystroke of "orange" and the third of "android".
+            let typing = last && fuzziness.as_deref().is_some_and(|f| f.prefix);
+
             let stripped = word.trim_start_matches('-');
             exclude |= stripped.len() != word.len();
 
             if stripped.is_empty() {
                 // A lone `-` excludes what comes next, e.g. a phrase.
                 continue;
-            } else if !exclude && stripped.eq_ignore_ascii_case("or") {
-                add_alternative(&mut alternatives, &mut clauses);
-            } else if !exclude && stripped.eq_ignore_ascii_case("and") {
+            } else if !exclude && !typing && stripped.eq_ignore_ascii_case("or") {
+                add_alternative(&mut alternatives, &mut clauses, fuzziness.as_deref_mut());
+            } else if !exclude && !typing && stripped.eq_ignore_ascii_case("and") {
                 continue;
-            } else if exclude {
-                add_clause(parser, &mut clauses, stripped, mem::take(&mut exclude))?;
-            } else if let Some(fuzziness) = fuzziness.as_deref_mut() {
+            } else if let Some(fuzziness) = fuzziness.as_deref_mut().filter(|_| !exclude) {
                 add_word(parser, &mut clauses, stripped, fuzziness, last)?;
             } else {
-                add_clause(parser, &mut clauses, stripped, false)?;
+                add_clause(
+                    parser,
+                    &mut clauses,
+                    stripped,
+                    mem::take(&mut exclude),
+                    None,
+                )?;
             }
         }
     }
 
-    add_alternative(&mut alternatives, &mut clauses);
+    add_alternative(&mut alternatives, &mut clauses, fuzziness);
 
     Ok(match alternatives.len() {
         0 => Box::new(EmptyQuery),
@@ -140,16 +246,64 @@ fn add_clause(
     clauses: &mut Clauses,
     text: &str,
     exclude: bool,
+    inside: Option<&mut Fuzziness>,
 ) -> Result<(), TantivyError> {
     let query = exact_query(parser, text)?;
+    let empty = query.downcast_ref::<EmptyQuery>().is_some();
+
+    let mut matches = Clauses::new();
+
+    if !empty {
+        matches.push((Occur::Should, query));
+    }
+
+    if let Some(fuzziness) = inside {
+        if let Some(query) = substring_query(fuzziness, text) {
+            // The groups of a phrase can sit in an event that doesn't hold
+            // the phrase, so remember it and check the text later.
+            let tokens = fuzziness.tokens(text);
+            fuzziness.needle(text, &tokens);
+            matches.push((Occur::Should, query));
+        }
+    }
+
+    let occur = if exclude { Occur::MustNot } else { Occur::Must };
 
     // Text without any tokens, like ":)", doesn't restrict the search.
-    if query.downcast_ref::<EmptyQuery>().is_none() {
-        let occur = if exclude { Occur::MustNot } else { Occur::Must };
-        clauses.push((occur, query));
+    match matches.len() {
+        0 => (),
+        1 => clauses.push((occur, matches.remove(0).1)),
+        _ => clauses.push((occur, Box::new(BooleanQuery::new(matches)))),
     }
 
     Ok(())
+}
+
+/// Match the text inside the text of an event, as groups of characters.
+///
+/// A group doesn't know where it sits, so this finds every event that
+/// contains the text, plus a few that only contain all of its groups.
+fn substring_query(fuzziness: &mut Fuzziness, text: &str) -> Option<Box<dyn Query>> {
+    if !fuzziness.substring {
+        return None;
+    }
+
+    let grams = fuzziness.grams(text);
+
+    if grams.is_empty() {
+        return None;
+    }
+
+    let clauses: Clauses = grams
+        .iter()
+        .map(|gram| {
+            let term = Term::from_field_text(fuzziness.substring_field, gram);
+            let query: Box<dyn Query> = Box::new(TermQuery::new(term, IndexRecordOption::Basic));
+            (Occur::Must, query)
+        })
+        .collect();
+
+    Some(Box::new(BooleanQuery::new(clauses)))
 }
 
 /// Add a word that matches exactly, or as a prefix or with typos.
@@ -205,7 +359,17 @@ fn add_word(
                 matches.push((Occur::Should, Box::new(PhrasePrefixQuery::new(terms))));
             }
         }
+        // A word of several tokens that isn't the one being typed matches
+        // exactly. Tantivy has no fuzzy phrase query, so a typo in "e-mail"
+        // or in CJK text finds nothing.
         _ => (),
+    }
+
+    if let Some(query) = substring_query(fuzziness, text) {
+        // The groups of a word can sit in an event that doesn't hold the
+        // word, so remember the word and check the text later.
+        fuzziness.needle(text, &tokens);
+        matches.push((Occur::Should, query));
     }
 
     match matches.len() {
@@ -230,9 +394,19 @@ fn typo_distance(word: &str) -> u8 {
 }
 
 /// Close the current alternative, the next clauses start a new one.
-fn add_alternative(alternatives: &mut Clauses, clauses: &mut Clauses) {
-    if !clauses.is_empty() {
-        let alternative = BooleanQuery::new(mem::take(clauses));
-        alternatives.push((Occur::Should, Box::new(alternative)));
+fn add_alternative(
+    alternatives: &mut Clauses,
+    clauses: &mut Clauses,
+    fuzziness: Option<&mut Fuzziness>,
+) {
+    if clauses.is_empty() {
+        return;
+    }
+
+    let alternative = BooleanQuery::new(mem::take(clauses));
+    alternatives.push((Occur::Should, Box::new(alternative)));
+
+    if let Some(fuzziness) = fuzziness {
+        fuzziness.close();
     }
 }

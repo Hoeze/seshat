@@ -331,6 +331,12 @@ class Seshat {
      * "off" (default), "fallback" (only if nothing matches exactly) or
      * "always". Words may have no typo up to 4 characters, one for 5 to 8
      * characters, and two from 9 characters on.
+     * @param  {boolean} args.substring_search Should words also match inside
+     * words, e.g. <code>bernet</code> finds "Kubernetes" and the phrase
+     * <code>"es clu"</code> finds "Kubernetes cluster". Words and phrases need
+     * at least 3 characters for that. No event containing them is missed,
+     * while a few events match that only contain the same groups of 3
+     * characters.
      * @param  {string} args.next_batch The token to request the next page of
      * results.
      *

@@ -61,7 +61,7 @@ use crate::events::CheckpointDirection;
 #[cfg(test)]
 use crate::{EVENT, TOPIC_EVENT};
 
-const DATABASE_VERSION: i64 = 5;
+const DATABASE_VERSION: i64 = 6;
 const EVENTS_DB_NAME: &str = "events.db";
 
 pub(crate) enum ThreadMessage {

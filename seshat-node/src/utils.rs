@@ -124,6 +124,10 @@ pub(crate) fn parse_search_object(
         config.typo_tolerance(typo_tolerance);
     }
 
+    if let Some(v) = argument.get_opt::<JsBoolean, _, _>(&mut *cx, "substring_search")? {
+        config.substring_search(v.value(cx));
+    }
+
     if let Some(r) = argument.get_opt::<JsString, _, _>(&mut *cx, "room_id")? {
         config.for_room(&r.value(cx));
     }
