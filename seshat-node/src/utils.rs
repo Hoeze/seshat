@@ -16,7 +16,7 @@ use crate::Seshat;
 use neon::prelude::*;
 use seshat::{
     CheckpointDirection, Config, CrawlerCheckpoint, Event, EventType, Language, Profile, Receiver,
-    SearchConfig, SearchResult,
+    SearchConfig, SearchResult, TypoTolerance,
 };
 use std::cell::RefCell;
 use uuid::Uuid;
@@ -107,6 +107,21 @@ pub(crate) fn parse_search_object(
 
     if let Some(v) = argument.get_opt::<JsBoolean, _, _>(&mut *cx, "query_syntax")? {
         config.query_syntax(v.value(cx));
+    }
+
+    if let Some(v) = argument.get_opt::<JsBoolean, _, _>(&mut *cx, "prefix_search")? {
+        config.prefix_search(v.value(cx));
+    }
+
+    if let Some(v) = argument.get_opt::<JsString, _, _>(&mut *cx, "typo_tolerance")? {
+        let value = v.value(cx);
+        let typo_tolerance = match value.as_str() {
+            "off" => TypoTolerance::Off,
+            "fallback" => TypoTolerance::Fallback,
+            "always" => TypoTolerance::Always,
+            _ => return cx.throw_type_error(format!("Invalid typo tolerance {}", value)),
+        };
+        config.typo_tolerance(typo_tolerance);
     }
 
     if let Some(r) = argument.get_opt::<JsString, _, _>(&mut *cx, "room_id")? {

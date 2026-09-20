@@ -322,6 +322,15 @@ class Seshat {
      * with Tantivy's query syntax, e.g. <code>sender:"@alice:example.org"</code>.
      * The default is the syntax of Synapse's server-side search, which never
      * fails. An invalid Tantivy query rejects the promise.
+     * @param  {boolean} args.prefix_search Should the last word of the search
+     * term also match as the start of a word, e.g. <code>kuber</code> finds
+     * "Kubernetes". Meant for a search that runs while the user types. The
+     * last word needs at least 2 characters for that. A term that ends with
+     * whitespace is taken as complete.
+     * @param  {string} args.typo_tolerance When words may match with typos:
+     * "off" (default), "fallback" (only if nothing matches exactly) or
+     * "always". Words may have no typo up to 4 characters, one for 5 to 8
+     * characters, and two from 9 characters on.
      * @param  {string} args.next_batch The token to request the next page of
      * results.
      *

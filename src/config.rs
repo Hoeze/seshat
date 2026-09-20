@@ -35,6 +35,23 @@ pub struct SearchConfig {
     pub(crate) keys: Vec<EventType>,
     pub(crate) next_batch: Option<Uuid>,
     pub(crate) query_syntax: bool,
+    pub(crate) prefix_search: bool,
+    pub(crate) typo_tolerance: TypoTolerance,
+}
+
+/// When the words of a search term may match with typos.
+///
+/// How many typos a word may have depends on its length: none up to 4
+/// characters, one for 5 to 8 characters, and two from 9 characters on.
+#[derive(Debug, Default, PartialEq, Eq, Clone, Copy, Serialize, Deserialize)]
+pub enum TypoTolerance {
+    /// Words only match without typos.
+    #[default]
+    Off,
+    /// Words match with typos only if the search finds nothing without them.
+    Fallback,
+    /// Words always match with typos as well.
+    Always,
 }
 
 impl SearchConfig {
@@ -141,6 +158,38 @@ impl SearchConfig {
         self.query_syntax = query_syntax;
         self
     }
+
+    /// Should the last word of the search term also match as the start of a
+    /// word, for a search that runs while the user types.
+    ///
+    /// For example, `kuber` finds "Kubernetes". The last word needs at least
+    /// 2 characters for that, a single character only matches as a whole
+    /// word. A search term that ends with whitespace or a closing quote is
+    /// taken as complete. Only the default
+    /// syntax in the language-based tokenizer mode supports this, the N-gram
+    /// mode matches parts of words anyway.
+    ///
+    /// # Arguments
+    ///
+    /// * `prefix_search` - Flag to determine if the last word is a prefix.
+    pub fn prefix_search(&mut self, prefix_search: bool) -> &mut Self {
+        self.prefix_search = prefix_search;
+        self
+    }
+
+    /// Should the words of the search term also match with typos.
+    ///
+    /// Only the default syntax in the language-based tokenizer mode supports
+    /// this. Words that are excluded with `-` or are part of a phrase always
+    /// match exactly.
+    ///
+    /// # Arguments
+    ///
+    /// * `typo_tolerance` - When words may match with typos.
+    pub fn typo_tolerance(&mut self, typo_tolerance: TypoTolerance) -> &mut Self {
+        self.typo_tolerance = typo_tolerance;
+        self
+    }
 }
 
 impl Default for SearchConfig {
@@ -154,6 +203,8 @@ impl Default for SearchConfig {
             keys: Vec::new(),
             next_batch: None,
             query_syntax: false,
+            prefix_search: false,
+            typo_tolerance: TypoTolerance::Off,
         }
     }
 }
@@ -184,7 +235,7 @@ pub enum Language {
 impl Language {
     pub(crate) fn as_tokenizer_name(&self) -> String {
         match self {
-            Language::Unknown => "default".to_owned(),
+            Language::Unknown => "seshat_default".to_owned(),
             lang => format!("seshat_{:?}", lang),
         }
     }

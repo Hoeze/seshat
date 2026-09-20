@@ -34,6 +34,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   language-based mode. For example, `kubernetes` finds "Kubernetes". Existing
   N-gram indexes get rebuilt anyway, because of the Tantivy upgrade.
 
+- Search ignores accents now, in both tokenizer modes. For example, `cafe`
+  finds "Café" and `strasse` finds "Straße". Existing indexes get rebuilt
+  anyway, because of the Tantivy upgrade.
+
+- Two new search options help a search that runs while the user types.
+  `SearchConfig::prefix_search()` lets the last word also match as the start
+  of a word, from 2 characters on, so `kuber` finds "Kubernetes".
+  `SearchConfig::typo_tolerance()`
+  lets words match with typos, always or only if nothing matches exactly.
+  The Node bindings take `prefix_search` and `typo_tolerance`. Both options
+  only work with the default syntax in the language-based tokenizer mode.
+
 - A reindex commits every 2,000 events instead of every 500, which makes it
   about 25% faster.
 

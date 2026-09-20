@@ -36,7 +36,7 @@ use uuid::Uuid;
 #[cfg(feature = "encryption")]
 use crate::index::encrypted_dir::{EncryptedMmapDirectory, PBKDF_COUNT};
 use crate::{
-    config::{Config, Language, SearchConfig, TokenizerMode},
+    config::{Config, Language, SearchConfig, TokenizerMode, TypoTolerance},
     events::{Event, EventId, EventType},
 };
 
@@ -88,6 +88,8 @@ pub(crate) struct Index {
     sender_field: tv::schema::Field,
     date_field: tv::schema::Field,
     room_id_field: tv::schema::Field,
+    /// The index holds whole words, not N-grams.
+    word_tokens: bool,
     search_cache: Arc<RwLock<LruCache<Uuid, Search>>>,
 }
 
@@ -216,6 +218,7 @@ pub(crate) struct IndexSearcher {
     sender_field: tv::schema::Field,
     date_field: tv::schema::Field,
     event_id_field: tv::schema::Field,
+    word_tokens: bool,
     search_cache: Arc<RwLock<LruCache<Uuid, Search>>>,
 }
 
@@ -224,6 +227,7 @@ impl IndexSearcher {
         &self,
         term: &str,
         config: &SearchConfig,
+        typos: bool,
     ) -> Result<Box<dyn tv::query::Query>, tv::TantivyError> {
         let mut keys = Vec::new();
 
@@ -246,15 +250,29 @@ impl IndexSearcher {
         let query: Box<dyn tv::query::Query> = if term.is_empty() {
             Box::new(tv::query::AllQuery)
         } else {
-            let mut query_parser =
-                tv::query::QueryParser::new(self.schema.clone(), keys, self.tokenizer.clone());
+            let mut query_parser = tv::query::QueryParser::new(
+                self.schema.clone(),
+                keys.clone(),
+                self.tokenizer.clone(),
+            );
 
             if config.query_syntax {
                 // All words have to match in both syntaxes.
                 query_parser.set_conjunction_by_default();
                 query_parser.parse_query(term)?
             } else {
-                search_syntax::parse(&query_parser, term)?
+                // N-grams match parts of words anyway, and typos in N-grams
+                // make no sense.
+                let mut fuzziness =
+                    (self.word_tokens && (config.prefix_search || typos)).then(|| {
+                        search_syntax::Fuzziness {
+                            fields: keys,
+                            normalizer: Index::word_normalizer(),
+                            prefix: config.prefix_search,
+                            typos,
+                        }
+                    });
+                search_syntax::parse(&query_parser, term, fuzziness.as_mut())?
             }
         };
 
@@ -373,7 +391,8 @@ impl IndexSearcher {
         };
 
         let (page, term, config) = if let Some(past_search) = past_search {
-            let query = self.parse_query(term, &past_search.search_config)?;
+            let typos = past_search.search_config.typo_tolerance == TypoTolerance::Always;
+            let query = self.parse_query(term, &past_search.search_config, typos)?;
             let previous_results = &past_search.event_ids;
 
             let mut page = self.search_helper(
@@ -393,18 +412,33 @@ impl IndexSearcher {
                 past_search.search_config.clone(),
             )
         } else {
-            let query = self.parse_query(term, config)?;
-            (
-                self.search_helper(
+            let mut config = config.clone();
+            let typos = config.typo_tolerance == TypoTolerance::Always;
+            let query = self.parse_query(term, &config, typos)?;
+            let mut page = self.search_helper(
+                config.limit,
+                config.limit,
+                config.order_by_recency,
+                &[],
+                &query,
+            )?;
+
+            // Only search with typos if the search without them found nothing.
+            if page.count == 0 && config.typo_tolerance == TypoTolerance::Fallback {
+                let query = self.parse_query(term, &config, true)?;
+                page = self.search_helper(
                     config.limit,
                     config.limit,
                     config.order_by_recency,
                     &[],
                     &query,
-                )?,
-                Arc::new(term.to_owned()),
-                Arc::new(config.clone()),
-            )
+                )?;
+
+                // The next pages have to come from the same search.
+                config.typo_tolerance = TypoTolerance::Always;
+            }
+
+            (page, Arc::new(term.to_owned()), Arc::new(config))
         };
 
         let next_batch = if page.event_ids.len() == page.count {
@@ -456,7 +490,8 @@ impl Index {
         let index = Index::open_index(path, config, schema)?;
         let reader = index.reader()?;
 
-        // Register tokenizer based on mode
+        // Register tokenizer based on mode. Both modes fold accents, so that
+        // e.g. "cafe" finds "Café".
         match &config.tokenizer_mode {
             TokenizerMode::Ngram { min_gram, max_gram } => {
                 // Lowercase the n-grams, so that search is case-insensitive
@@ -465,25 +500,25 @@ impl Index {
                     tv::tokenizer::NgramTokenizer::new(*min_gram, *max_gram, false)?,
                 )
                 .filter(tv::tokenizer::LowerCaser)
+                .filter(tv::tokenizer::AsciiFoldingFilter)
                 .build();
                 index
                     .tokenizers()
                     .register(&tokenizer_name, ngram_tokenizer);
             }
             TokenizerMode::LanguageBased => {
-                match config.language {
-                    Language::Unknown => (), // Use default tokenizer
-                    _ => {
-                        let tokenizer = tv::tokenizer::TextAnalyzer::builder(
-                            tv::tokenizer::SimpleTokenizer::default(),
-                        )
-                        .filter(tv::tokenizer::RemoveLongFilter::limit(40))
-                        .filter(tv::tokenizer::LowerCaser)
-                        .filter(tv::tokenizer::Stemmer::new(config.language.as_tantivy()))
-                        .build();
-                        index.tokenizers().register(&tokenizer_name, tokenizer);
-                    }
-                }
+                let tokenizer = match config.language {
+                    Language::Unknown => Index::word_normalizer(),
+                    _ => tv::tokenizer::TextAnalyzer::builder(
+                        tv::tokenizer::SimpleTokenizer::default(),
+                    )
+                    .filter(tv::tokenizer::RemoveLongFilter::limit(40))
+                    .filter(tv::tokenizer::LowerCaser)
+                    .filter(tv::tokenizer::Stemmer::new(config.language.as_tantivy()))
+                    .filter(tv::tokenizer::AsciiFoldingFilter)
+                    .build(),
+                };
+                index.tokenizers().register(&tokenizer_name, tokenizer);
             }
         }
 
@@ -497,8 +532,23 @@ impl Index {
             sender_field,
             date_field,
             room_id_field,
+            word_tokens: config.tokenizer_mode == TokenizerMode::LanguageBased,
             search_cache: Arc::new(RwLock::new(LruCache::new(SEARCH_CACHE_SIZE))),
         })
+    }
+
+    /// Split text into lowercase words without accents, like Tantivy's
+    /// default tokenizer plus accent folding.
+    ///
+    /// This is the tokenizer of the language-based mode without a language.
+    /// Prefixes and typos are matched against words normalized like this in
+    /// every language, because stemming a partial word makes no sense.
+    fn word_normalizer() -> tv::tokenizer::TextAnalyzer {
+        tv::tokenizer::TextAnalyzer::builder(tv::tokenizer::SimpleTokenizer::default())
+            .filter(tv::tokenizer::RemoveLongFilter::limit(40))
+            .filter(tv::tokenizer::LowerCaser)
+            .filter(tv::tokenizer::AsciiFoldingFilter)
+            .build()
     }
 
     #[cfg(feature = "encryption")]
@@ -567,6 +617,7 @@ impl Index {
             sender_field: self.sender_field,
             date_field: self.date_field,
             event_id_field: self.event_id_field,
+            word_tokens: self.word_tokens,
             search_cache: self.search_cache.clone(),
         }
     }
@@ -971,6 +1022,130 @@ fn ngram_tokenizer_is_case_insensitive() {
             term
         );
     }
+}
+
+#[test]
+fn accents_are_folded() {
+    let tmpdir = TempDir::new().unwrap();
+    let index = Index::new(&tmpdir, &Config::new()).unwrap();
+
+    let mut event = EVENT.clone();
+    event.content_value = "Café au lait in der Müllerstraße".to_string();
+
+    let mut writer = index.get_writer().unwrap();
+    writer.add_event(&event).unwrap();
+    writer.force_commit().unwrap();
+    index.reload().unwrap();
+
+    let searcher = index.get_searcher();
+
+    for term in &["cafe", "Café", "CAFE", "mullerstrasse", "Müllerstraße"] {
+        let result = searcher.search(term, &Default::default()).unwrap().results;
+        assert_eq!(
+            result.len(),
+            1,
+            "Search for {:?} didn't find the event",
+            term
+        );
+    }
+}
+
+#[test]
+fn prefix_search() {
+    let tmpdir = TempDir::new().unwrap();
+    let index = Index::new(&tmpdir, &Config::new()).unwrap();
+
+    let mut event = EVENT.clone();
+    event.content_value = "Our Kubernetes cluster sends an e-mail".to_string();
+
+    let mut writer = index.get_writer().unwrap();
+    writer.add_event(&event).unwrap();
+    writer.force_commit().unwrap();
+    index.reload().unwrap();
+
+    let searcher = index.get_searcher();
+    let finds = |term: &str, prefix: bool| {
+        let mut config = SearchConfig::new();
+        config.prefix_search(prefix);
+        !searcher.search(term, &config).unwrap().results.is_empty()
+    };
+
+    // The last word also matches as the start of a word.
+    for term in &[
+        "kuber",
+        "KUBE",
+        "our kub",
+        "cluster ku",
+        "e-ma",
+        "\"our kubernetes\" clu",
+    ] {
+        assert!(
+            finds(term, true),
+            "Search for {:?} didn't find the event",
+            term
+        );
+        assert!(!finds(term, false), "Search for {:?} found the event", term);
+    }
+
+    // Other words, words followed by whitespace and phrases are complete. A
+    // single character only matches as a whole word.
+    for term in &[
+        "kuber cluster",
+        "kuber ",
+        "\"kuber\"",
+        "\"our kuber",
+        "cluster k",
+        "e-m",
+    ] {
+        assert!(!finds(term, true), "Search for {:?} found the event", term);
+    }
+
+    // An excluded word is complete as well, so this doesn't exclude "sends".
+    assert!(finds("cluster -sen", true));
+}
+
+#[test]
+fn typo_tolerance() {
+    let tmpdir = TempDir::new().unwrap();
+    let index = Index::new(&tmpdir, &Config::new()).unwrap();
+
+    let mut writer = index.get_writer().unwrap();
+
+    for (i, body) in ["Our Kubernetes cluster is down", "The clusters are up"]
+        .iter()
+        .enumerate()
+    {
+        let mut event = EVENT.clone();
+        event.event_id = format!("$typo{}:example.org", i);
+        event.content_value = body.to_string();
+        writer.add_event(&event).unwrap();
+    }
+
+    writer.force_commit().unwrap();
+    index.reload().unwrap();
+
+    let searcher = index.get_searcher();
+    let count = |term: &str, typos: TypoTolerance| {
+        let mut config = SearchConfig::new();
+        config.typo_tolerance(typos);
+        searcher.search(term, &config).unwrap().count
+    };
+
+    assert_eq!(count("kubernets", TypoTolerance::Off), 0);
+
+    // No typo up to 4 characters, one for 5 to 8, and two from 9 on. A
+    // transposition counts as one typo.
+    assert_eq!(count("dowm", TypoTolerance::Always), 0);
+    assert_eq!(count("kubernets", TypoTolerance::Always), 1);
+    assert_eq!(count("kuberentes", TypoTolerance::Always), 1);
+    assert_eq!(count("kubrnetis", TypoTolerance::Always), 1);
+    assert_eq!(count("kubrnets", TypoTolerance::Always), 0);
+
+    // "Always" adds typo matches to exact matches, "Fallback" only searches
+    // with typos if nothing matches exactly.
+    assert_eq!(count("cluster", TypoTolerance::Always), 2);
+    assert_eq!(count("cluster", TypoTolerance::Fallback), 1);
+    assert_eq!(count("kubernets", TypoTolerance::Fallback), 1);
 }
 
 #[test]
