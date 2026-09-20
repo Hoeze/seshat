@@ -16,6 +16,7 @@
 mod encrypted_dir;
 #[cfg(feature = "encryption")]
 mod encrypted_stream;
+mod script_tokenizer;
 mod search_syntax;
 
 use std::{
@@ -509,14 +510,12 @@ impl Index {
             TokenizerMode::LanguageBased => {
                 let tokenizer = match config.language {
                     Language::Unknown => Index::word_normalizer(),
-                    _ => tv::tokenizer::TextAnalyzer::builder(
-                        tv::tokenizer::SimpleTokenizer::default(),
-                    )
-                    .filter(tv::tokenizer::RemoveLongFilter::limit(40))
-                    .filter(tv::tokenizer::LowerCaser)
-                    .filter(tv::tokenizer::Stemmer::new(config.language.as_tantivy()))
-                    .filter(tv::tokenizer::AsciiFoldingFilter)
-                    .build(),
+                    _ => tv::tokenizer::TextAnalyzer::builder(script_tokenizer::ScriptTokenizer)
+                        .filter(tv::tokenizer::RemoveLongFilter::limit(40))
+                        .filter(tv::tokenizer::LowerCaser)
+                        .filter(tv::tokenizer::Stemmer::new(config.language.as_tantivy()))
+                        .filter(tv::tokenizer::AsciiFoldingFilter)
+                        .build(),
                 };
                 index.tokenizers().register(&tokenizer_name, tokenizer);
             }
@@ -537,14 +536,14 @@ impl Index {
         })
     }
 
-    /// Split text into lowercase words without accents, like Tantivy's
-    /// default tokenizer plus accent folding.
+    /// Split text into lowercase words without accents, and Chinese,
+    /// Japanese and Korean text into pairs of characters.
     ///
     /// This is the tokenizer of the language-based mode without a language.
     /// Prefixes and typos are matched against words normalized like this in
     /// every language, because stemming a partial word makes no sense.
     fn word_normalizer() -> tv::tokenizer::TextAnalyzer {
-        tv::tokenizer::TextAnalyzer::builder(tv::tokenizer::SimpleTokenizer::default())
+        tv::tokenizer::TextAnalyzer::builder(script_tokenizer::ScriptTokenizer)
             .filter(tv::tokenizer::RemoveLongFilter::limit(40))
             .filter(tv::tokenizer::LowerCaser)
             .filter(tv::tokenizer::AsciiFoldingFilter)
@@ -1146,6 +1145,47 @@ fn typo_tolerance() {
     assert_eq!(count("cluster", TypoTolerance::Always), 2);
     assert_eq!(count("cluster", TypoTolerance::Fallback), 1);
     assert_eq!(count("kubernets", TypoTolerance::Fallback), 1);
+}
+
+#[test]
+fn cjk_text_is_searchable_without_the_ngram_mode() {
+    let tmpdir = TempDir::new().unwrap();
+    let index = Index::new(&tmpdir, &Config::new()).unwrap();
+
+    let mut writer = index.get_writer().unwrap();
+
+    for (i, body) in ["東京タワーに行きました", "我是中国人", "Kubernetes in 東京"]
+        .iter()
+        .enumerate()
+    {
+        let mut event = EVENT.clone();
+        event.event_id = format!("$cjk{}:example.org", i);
+        event.content_value = body.to_string();
+        writer.add_event(&event).unwrap();
+    }
+
+    writer.force_commit().unwrap();
+    index.reload().unwrap();
+
+    let searcher = index.get_searcher();
+    let count = |term: &str| searcher.search(term, &Default::default()).unwrap().count;
+
+    // Words inside text without spaces, of two characters and more.
+    assert_eq!(count("東京"), 2);
+    assert_eq!(count("タワー"), 1);
+    assert_eq!(count("きました"), 1);
+    assert_eq!(count("中国"), 1);
+    assert_eq!(count("中国人"), 1);
+
+    // Words of other scripts in the same message still match as words.
+    assert_eq!(count("kubernetes"), 1);
+    assert_eq!(count("東京 kubernetes"), 1);
+
+    // A pair never crosses a change of script. Characters that are part of a
+    // pair therefore can't be found on their own, unlike "に行", where both
+    // characters stand alone between scripts.
+    assert_eq!(count("に行"), 1);
+    assert_eq!(count("京タ"), 0);
 }
 
 #[test]

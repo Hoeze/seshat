@@ -46,6 +46,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   The Node bindings take `prefix_search` and `typo_tolerance`. Both options
   only work with the default syntax in the language-based tokenizer mode.
 
+- The language-based tokenizer mode indexes Chinese, Japanese and Korean
+  text as overlapping pairs of characters now. Those languages write without
+  spaces between words, so a word tokenizer used to turn a whole sentence
+  into one token. Text of other scripts in the same message stays split into
+  words. Lucene, Elasticsearch and Solr handle CJK text the same way. The
+  N-gram mode is still the only one that matches inside words.
+
 - A reindex commits every 2,000 events instead of every 500, which makes it
   about 25% faster.
 
