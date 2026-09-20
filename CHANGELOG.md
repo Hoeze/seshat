@@ -65,6 +65,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   count of a search counts the events before the check, so it can be higher
   than the number of results.
 
+- An index whose fields don't match the ones seshat builds asks for a
+  reindex now, instead of failing to open. A database version that someone
+  forgot to raise used to break the index until the user deleted it.
+
 - The language-based tokenizer mode indexes Chinese, Japanese and Korean
   text as overlapping pairs of characters now. Those languages write without
   spaces between words, so a word tokenizer used to turn a whole sentence

@@ -317,7 +317,14 @@ impl Database {
     }
 
     fn create_index<P: AsRef<Path>>(path: &P, config: &Config) -> Result<Index> {
-        Ok(Index::new(path, config)?)
+        match Index::new(path, config) {
+            // An index that was written with a different set of fields can
+            // only be rebuilt, so ask for a reindex instead of failing. The
+            // database version catches this as well, but a version that
+            // someone forgot to raise would break the index for good.
+            Err(tantivy::TantivyError::SchemaError(_)) => Err(Error::ReindexError),
+            result => Ok(result?),
+        }
     }
 
     /// Load the set of event IDs that have been replaced by edit events.
