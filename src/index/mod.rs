@@ -105,6 +105,16 @@ pub(crate) struct SearchResult {
     pub(crate) next_batch: Option<Uuid>,
 }
 
+/// One page of a search of the index.
+struct Page {
+    /// How many events the query matched.
+    count: usize,
+    /// The events of this page, with their score.
+    results: Vec<(f32, EventId)>,
+    /// The ids of those events, to skip them on the next page.
+    event_ids: Vec<EventId>,
+}
+
 pub(crate) struct Writer {
     inner: tv::IndexWriter,
     body_field: tv::schema::Field,
@@ -265,7 +275,6 @@ impl IndexSearcher {
         })
     }
 
-    #[allow(clippy::type_complexity)]
     fn search_helper(
         &self,
         og_limit: usize,
@@ -273,7 +282,7 @@ impl IndexSearcher {
         order_by_recency: bool,
         previous_results: &[EventId],
         query: &dyn tv::query::Query,
-    ) -> Result<((usize, Vec<(f32, EventId)>), Vec<EventId>), tv::TantivyError> {
+    ) -> Result<Page, tv::TantivyError> {
         let mut multicollector = MultiCollector::new();
         let count_handle = multicollector.add_collector(Count);
 
@@ -332,21 +341,23 @@ impl IndexSearcher {
             }
         }
 
-        if docs.len() < og_limit {
-            if end {
-                Ok(((count, docs), event_ids))
-            } else {
-                self.search_helper(
-                    og_limit,
-                    limit + SEARCH_LIMIT_INCREMENT,
-                    order_by_recency,
-                    previous_results,
-                    query,
-                )
-            }
-        } else {
-            Ok(((count, docs), event_ids))
+        // A page that isn't full yet, with matches left to look at, needs a
+        // wider search.
+        if docs.len() < og_limit && !end {
+            return self.search_helper(
+                og_limit,
+                limit + SEARCH_LIMIT_INCREMENT,
+                order_by_recency,
+                previous_results,
+                query,
+            );
         }
+
+        Ok(Page {
+            count,
+            results: docs,
+            event_ids,
+        })
     }
 
     pub fn search(
@@ -361,11 +372,11 @@ impl IndexSearcher {
             None
         };
 
-        let ((result, event_ids), term, config) = if let Some(past_search) = past_search {
+        let (page, term, config) = if let Some(past_search) = past_search {
             let query = self.parse_query(term, &past_search.search_config)?;
             let previous_results = &past_search.event_ids;
 
-            let (result, mut event_ids) = self.search_helper(
+            let mut page = self.search_helper(
                 config.limit,
                 config.limit,
                 config.order_by_recency,
@@ -374,10 +385,10 @@ impl IndexSearcher {
             )?;
 
             // Add the previous results to the current ones.
-            event_ids.extend(previous_results.iter().cloned());
+            page.event_ids.extend(previous_results.iter().cloned());
 
             (
-                (result, event_ids),
+                page,
                 past_search.search_term.clone(),
                 past_search.search_config.clone(),
             )
@@ -396,16 +407,14 @@ impl IndexSearcher {
             )
         };
 
-        let (count, results) = result;
-
-        let next_batch = if event_ids.len() == count {
+        let next_batch = if page.event_ids.len() == page.count {
             None
         } else {
             let mut search_cache = self.search_cache.write().unwrap();
             let search = Search {
                 search_term: term,
                 search_config: config,
-                event_ids: Arc::new(event_ids),
+                event_ids: Arc::new(page.event_ids),
             };
 
             let token = Uuid::new_v4();
@@ -414,8 +423,8 @@ impl IndexSearcher {
         };
 
         Ok(SearchResult {
-            count,
-            results,
+            count: page.count,
+            results: page.results,
             next_batch,
         })
     }
